@@ -1,0 +1,23 @@
+# ~/.config/direnv/direnvrc — shared helpers for project .envrc files.
+
+# Usage in a project .envrc:
+#   use_polysim_env
+# Sources ~/.config/polysim/env.sh and mcp-secrets.sh if present.
+use_polysim_env() {
+  local cfg="${POLYSIM_CFG_DIR:-$HOME/.config/polysim}"
+  for f in "$cfg/env.sh" "$cfg/mcp-secrets.sh"; do
+    if [ -r "$f" ]; then
+      watch_file "$f"
+      # shellcheck source=/dev/null
+      . "$f"
+    fi
+  done
+}
+
+# Layout shortcuts
+layout_uv() {
+  if [ ! -d .venv ]; then
+    uv venv
+  fi
+  source .venv/bin/activate
+}

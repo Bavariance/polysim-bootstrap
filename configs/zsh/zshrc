@@ -1,0 +1,55 @@
+# ~/.zshrc — interactive shell config. Minimal, no plugin manager.
+
+# ---- history ----------------------------------------------------------------
+HISTFILE="$HOME/.zsh_history"
+HISTSIZE=50000
+SAVEHIST=50000
+setopt SHARE_HISTORY HIST_IGNORE_DUPS HIST_IGNORE_SPACE HIST_REDUCE_BLANKS
+
+# ---- completion -------------------------------------------------------------
+autoload -Uz compinit && compinit -i
+zstyle ':completion:*' menu select
+zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
+
+# ---- prompt (minimal, no external deps) -------------------------------------
+autoload -Uz vcs_info
+precmd() { vcs_info }
+zstyle ':vcs_info:git:*' formats ' (%b)'
+setopt PROMPT_SUBST
+PROMPT='%F{cyan}%n@%m%f %F{yellow}%~%f%F{magenta}${vcs_info_msg_0_}%f %# '
+
+# ---- key bindings -----------------------------------------------------------
+bindkey -e
+bindkey '^[[A' history-search-backward
+bindkey '^[[B' history-search-forward
+
+# ---- tools ------------------------------------------------------------------
+
+# fnm (Node version manager)
+if command -v fnm >/dev/null 2>&1; then
+  eval "$(fnm env --shell zsh)"
+fi
+
+# direnv
+if command -v direnv >/dev/null 2>&1; then
+  eval "$(direnv hook zsh)"
+fi
+
+# uv (Python)
+[ -f "$HOME/.local/bin/env" ] && . "$HOME/.local/bin/env"
+
+# ---- polysim env (managed by restore-secrets.sh) ----------------------------
+for f in "$HOME/.config/polysim/env.sh" "$HOME/.config/polysim/mcp-secrets.sh"; do
+  [ -r "$f" ] && . "$f"
+done
+
+# ---- aliases ----------------------------------------------------------------
+alias g=git
+alias ll='ls -lah'
+alias gs='git status'
+alias gd='git diff'
+alias gl='git log --oneline --graph --decorate -20'
+command -v fdfind >/dev/null 2>&1 && alias fd=fdfind
+
+# ---- local overrides (gitignored) -------------------------------------------
+[ -r "$HOME/.zshrc.local" ] && . "$HOME/.zshrc.local"

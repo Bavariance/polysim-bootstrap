@@ -1,0 +1,41 @@
+# --- secrets: never commit anything that could possibly hold one ---
+*.env
+*.env.*
+.env
+.env.*
+*.secret
+*.secrets
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+*.cer
+id_rsa*
+id_ed25519*
+id_ecdsa*
+id_dsa*
+known_hosts
+authorized_keys
+.netrc
+.git-credentials
+
+# Bitwarden session/state
+.bw-session
+session.txt
+bw_session
+configs/polysim/*.local.sh
+configs/polysim/env.sh
+configs/polysim/mcp-secrets.sh
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local install logs
+*.log
+bootstrap/*.local.sh
