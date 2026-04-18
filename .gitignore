@@ -27,6 +27,8 @@ bw_session
 configs/polysim/*.local.sh
 configs/polysim/env.sh
 configs/polysim/mcp-secrets.sh
+configs/polysim/.bw-session
+configs/polysim/gh-token
 
 # OS / editor cruft
 .DS_Store
