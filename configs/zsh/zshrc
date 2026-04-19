@@ -38,11 +38,15 @@ fi
 # uv (Python)
 [ -f "$HOME/.local/bin/env" ] && . "$HOME/.local/bin/env"
 
-# ~/.local/bin on PATH (where bws may live for non-root installs)
-case ":$PATH:" in
-  *":$HOME/.local/bin:"*) ;;
-  *) PATH="$HOME/.local/bin:$PATH" ;;
-esac
+# ~/.local/bin and ~/.bun/bin on PATH (bws/zellij may live in the former
+# for non-root installs; bun installs to the latter by default)
+for _polysim_bin in "$HOME/.local/bin" "$HOME/.bun/bin"; do
+  case ":$PATH:" in
+    *":$_polysim_bin:"*) ;;
+    *) [ -d "$_polysim_bin" ] && PATH="$_polysim_bin:$PATH" ;;
+  esac
+done
+unset _polysim_bin
 
 # ---- polysim shell init (BWS_ACCESS_TOKEN, BWS_PROJECT_ID) ------------------
 [ -r "$HOME/.config/polysim/shell-init.sh" ] && . "$HOME/.config/polysim/shell-init.sh"

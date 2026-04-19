@@ -12,9 +12,11 @@ from **Bitwarden Secrets Manager** via the `bws` CLI.
 
 ## What it sets up
 
-- **Packages**: `zsh`, `bash`, `tmux`, `git`, `curl`, `direnv`, `jq`, `ripgrep`, `fd`, build tools
-- **Languages / tooling**: Node 22 (via [`fnm`](https://github.com/Schniz/fnm)), [`uv`](https://github.com/astral-sh/uv) for Python, Docker CLI
-- **CLIs**: `gh` (GitHub), `bws` (Bitwarden Secrets Manager), `claude` (Claude Code), `zellij` (terminal multiplexer)
+- **Packages**: `zsh`, `bash`, `tmux`, `git`, `curl`, `direnv`, `jq`, `ripgrep`, `fd`, `btop`, build tools
+- **Languages / runtimes**: Node 22 (via [`fnm`](https://github.com/Schniz/fnm)), [`uv`](https://github.com/astral-sh/uv) for Python, [`bun`](https://bun.sh) for fast JS/TS, Docker CLI
+- **Database CLIs**: `psql` (Postgres / Supabase), `redis-cli` (Redis inspection)
+- **Service CLIs**: `gh` (GitHub), `bws` (Bitwarden Secrets Manager), `stripe` (Stripe webhook forwarding), `claude` (Claude Code), `zellij` (terminal multiplexer)
+- **MCP server binaries**: `mcp-grafana` (the Grafana MCP server referenced by polysimulator's `.mcp.json`); `dokploy` MCP runs via `npx -y` with no install needed; `supabase`, `cloudflare`, `polymarket-docs` are HTTP MCPs with no binary needed
 - **VS Code**: Remote-SSH server prerequisites (so opening the host in VS Code "just works")
 - **Configs**: minimal `.zshrc`, `.zshenv`, `.bashrc`, `.bash_profile`, `.tmux.conf`, `direnvrc`, zellij config + polysimulator layout
 - **Secrets**: pulled from Bitwarden Secrets Manager into `<polysim-repo>/.env` with `chmod 600`

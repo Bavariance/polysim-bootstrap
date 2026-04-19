@@ -73,9 +73,12 @@ COMMON_PKGS=(
   curl wget git ca-certificates gnupg
   zsh tmux jq unzip xz-utils
   build-essential
-  python3 python3-pip
+  python3 python3-pip python3-venv
   pkg-config
   ripgrep fd-find
+  postgresql-client                # psql, for talking to Supabase
+  redis-tools                      # redis-cli, for inspecting Redis
+  btop                             # system monitor (used by zellij layout)
 )
 
 # Translate apt names → dnf names where they differ.
@@ -87,6 +90,9 @@ if [ "$PKG" = "dnf" ]; then
     python3 python3-pip
     pkgconf-pkg-config
     ripgrep fd-find
+    postgresql                     # provides psql on Fedora
+    redis                          # provides redis-cli
+    btop
   )
 fi
 
@@ -246,6 +252,105 @@ if ! have zellij; then
   fi
 fi
 
+# ---------------------------- bun (JS runtime) -------------------------------
+#
+# Used by the polysimulator zellij layout (`bunx ccusage`) and as a faster
+# Next.js dev runtime than npm. Official installer drops binary at ~/.bun/bin.
+
+if ! have bun; then
+  log "Installing bun…"
+  curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1 \
+    || warn "bun install failed — install manually if needed"
+fi
+export PATH="$HOME/.bun/bin:$PATH"
+
+# ---------------------------- stripe-cli -------------------------------------
+#
+# Polysimulator integrates Stripe; stripe-cli is needed for local webhook
+# forwarding (`stripe listen --forward-to localhost:8000/api/stripe/webhook`).
+# Released as .deb (apt) and .rpm (dnf) from GitHub.
+
+install_stripe_cli() {
+  local tmp version arch ext
+  tmp="$(mktemp -d)"
+
+  version="$(curl -fsSL https://api.github.com/repos/stripe/stripe-cli/releases/latest \
+             | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))")" \
+    || { warn "could not resolve stripe-cli version"; rm -rf "$tmp"; return 1; }
+
+  case "$(uname -m)" in
+    x86_64)  arch="amd64" ;;
+    aarch64) arch="arm64" ;;
+    *)       warn "unsupported arch for stripe-cli: $(uname -m)"; rm -rf "$tmp"; return 1 ;;
+  esac
+
+  case "$PKG" in apt) ext="deb" ;; dnf) ext="rpm" ;; esac
+
+  local url="https://github.com/stripe/stripe-cli/releases/download/v${version}/stripe_${version}_linux_${arch}.${ext}"
+  log "Downloading stripe-cli ${version} (${arch}.${ext})…"
+  curl -fsSL "$url" -o "$tmp/stripe.${ext}" \
+    || { warn "stripe-cli download failed"; rm -rf "$tmp"; return 1; }
+
+  if [ "$ext" = "deb" ]; then
+    $SUDO apt-get install -y "$tmp/stripe.deb" \
+      || { warn "stripe-cli install failed"; rm -rf "$tmp"; return 1; }
+  else
+    $SUDO dnf install -y "$tmp/stripe.rpm" \
+      || { warn "stripe-cli install failed"; rm -rf "$tmp"; return 1; }
+  fi
+  rm -rf "$tmp"
+  log "stripe-cli ${version} installed"
+}
+
+if ! have stripe; then
+  log "Installing stripe-cli…"
+  install_stripe_cli || warn "stripe-cli not installed — install manually if you need webhook forwarding"
+fi
+
+# ---------------------------- mcp-grafana ------------------------------------
+#
+# Stdio MCP server referenced by polysimulator's .mcp.json. Without this
+# binary, the grafana MCP server in Claude Code shows as failed.
+
+install_mcp_grafana() {
+  local dest="${1:-/usr/local/bin}"
+  local tmp version arch
+  tmp="$(mktemp -d)"
+
+  version="$(curl -fsSL https://api.github.com/repos/grafana/mcp-grafana/releases/latest \
+             | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))")" \
+    || { warn "could not resolve mcp-grafana version"; rm -rf "$tmp"; return 1; }
+
+  case "$(uname -m)" in
+    x86_64)  arch="x86_64" ;;
+    aarch64) arch="arm64" ;;
+    *)       warn "unsupported arch for mcp-grafana: $(uname -m)"; rm -rf "$tmp"; return 1 ;;
+  esac
+
+  local url="https://github.com/grafana/mcp-grafana/releases/download/v${version}/mcp-grafana_Linux_${arch}.tar.gz"
+  log "Downloading mcp-grafana ${version} (${arch})…"
+  curl -fsSL "$url" -o "$tmp/mcp-grafana.tar.gz" \
+    || { warn "mcp-grafana download failed"; rm -rf "$tmp"; return 1; }
+  tar -xzf "$tmp/mcp-grafana.tar.gz" -C "$tmp" \
+    || { warn "mcp-grafana extract failed"; rm -rf "$tmp"; return 1; }
+  install -m 0755 "$tmp/mcp-grafana" "$dest/mcp-grafana" \
+    || { warn "mcp-grafana install to $dest failed"; rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  log "mcp-grafana ${version} installed to ${dest}/mcp-grafana"
+}
+
+if ! have mcp-grafana; then
+  log "Installing mcp-grafana (Grafana MCP server)…"
+  if [ -w /usr/local/bin ] || { [ -n "$SUDO" ] && $SUDO test -w /usr/local/bin 2>/dev/null; }; then
+    TMP_DEST="$(mktemp -d)"
+    install_mcp_grafana "$TMP_DEST" && { $SUDO install -m 0755 "$TMP_DEST/mcp-grafana" /usr/local/bin/mcp-grafana || true; rm -rf "$TMP_DEST"; }
+    have mcp-grafana || install_mcp_grafana "$HOME/.local/bin"
+  else
+    mkdir -p "$HOME/.local/bin"
+    install_mcp_grafana "$HOME/.local/bin"
+  fi
+fi
+
 # ---------------------------- Claude Code CLI --------------------------------
 
 if ! have claude; then
@@ -268,7 +373,7 @@ fi
 # ---------------------------- summary ----------------------------------------
 
 log "Install complete. Versions:"
-for c in git zsh tmux direnv gh node npm uv bws zellij claude docker; do
+for c in git zsh tmux direnv gh node npm uv bun bws zellij claude docker stripe psql redis-cli btop mcp-grafana; do
   if have "$c"; then
     printf '  %-8s %s\n' "$c" "$("$c" --version 2>&1 | head -1)"
   else
