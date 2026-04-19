@@ -51,7 +51,21 @@ bind '"\e[B": history-search-forward'  2>/dev/null
 
 # ---- tools ------------------------------------------------------------------
 
-# fnm (Node version manager)
+# Build PATH first, BEFORE activating fnm/direnv/uv — they all live in
+# ~/.local-or-similar dirs that bash won't find unless we explicitly add them.
+#   ~/.local/bin           — bws, zellij, mcp-grafana (non-root installs)
+#   ~/.bun/bin             — bun installer's default
+#   ~/.local/share/fnm     — fnm binary (we pass --install-dir to keep it isolated)
+for _polysim_bin in "$HOME/.local/bin" "$HOME/.bun/bin" "$HOME/.local/share/fnm"; do
+  case ":$PATH:" in
+    *":$_polysim_bin:"*) ;;
+    *) [ -d "$_polysim_bin" ] && PATH="$_polysim_bin:$PATH" ;;
+  esac
+done
+unset _polysim_bin
+
+# fnm (Node version manager) — activates the default node, prepending its
+# bin dir (containing globally-npm-installed CLIs like `claude`) to PATH.
 if command -v fnm >/dev/null 2>&1; then
   eval "$(fnm env --shell bash)"
 fi
@@ -63,16 +77,6 @@ fi
 
 # uv (Python)
 [ -f "$HOME/.local/bin/env" ] && . "$HOME/.local/bin/env"
-
-# ~/.local/bin and ~/.bun/bin on PATH (bws/zellij may live in the former
-# for non-root installs; bun installs to the latter by default)
-for _polysim_bin in "$HOME/.local/bin" "$HOME/.bun/bin"; do
-  case ":$PATH:" in
-    *":$_polysim_bin:"*) ;;
-    *) [ -d "$_polysim_bin" ] && PATH="$_polysim_bin:$PATH" ;;
-  esac
-done
-unset _polysim_bin
 
 # ---- polysim shell init (BWS_ACCESS_TOKEN, BWS_PROJECT_ID) ------------------
 [ -r "$HOME/.config/polysim/shell-init.sh" ] && . "$HOME/.config/polysim/shell-init.sh"
