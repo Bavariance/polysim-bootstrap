@@ -60,12 +60,22 @@ CFG_DIR="$HOME/.config/polysim"
 TOKEN_FILE="$CFG_DIR/bws-token"
 PROJECT_FILE="$CFG_DIR/bws-project-id"
 
+# Strip surrounding whitespace + a single leading `<` / trailing `>` (common
+# copy-paste mistake when users paste the README's `<placeholder>` literally).
+sanitize() {
+  local v="$1"
+  v="${v#<}"; v="${v%>}"
+  printf '%s' "$v" | tr -d '[:space:]'
+}
+
 # ---- resolve auth ---------------------------------------------------------
 
 if [ -z "${BWS_ACCESS_TOKEN:-}" ] && [ -r "$TOKEN_FILE" ]; then
   BWS_ACCESS_TOKEN="$(cat "$TOKEN_FILE")"
   export BWS_ACCESS_TOKEN
 fi
+BWS_ACCESS_TOKEN="$(sanitize "${BWS_ACCESS_TOKEN:-}")"
+export BWS_ACCESS_TOKEN
 
 if [ -z "${BWS_ACCESS_TOKEN:-}" ]; then
   die "BWS_ACCESS_TOKEN not set and $TOKEN_FILE not found.
@@ -85,13 +95,27 @@ command -v bws >/dev/null 2>&1 \
 if [ -z "${BWS_PROJECT_ID:-}" ] && [ -r "$PROJECT_FILE" ]; then
   BWS_PROJECT_ID="$(cat "$PROJECT_FILE")"
 fi
+BWS_PROJECT_ID="$(sanitize "${BWS_PROJECT_ID:-}")"
 
-if [ -z "${BWS_PROJECT_ID:-}" ]; then
+if [ -z "$BWS_PROJECT_ID" ]; then
   warn "BWS_PROJECT_ID not set. Available projects:"
   bws project list >&2 || true
-  die "Set BWS_PROJECT_ID=<uuid>, or persist it:
-  mkdir -p $CFG_DIR && printf '%s\n' '<uuid>' > $PROJECT_FILE"
+  die "Set BWS_PROJECT_ID to your project UUID, or persist it:
+  mkdir -p $CFG_DIR && printf '%s\n' 'YOUR_PROJECT_UUID' > $PROJECT_FILE"
 fi
+
+if ! printf '%s' "$BWS_PROJECT_ID" \
+     | grep -qE '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+  die "BWS_PROJECT_ID is not a valid UUID: '$BWS_PROJECT_ID'
+Likely causes:
+  - You copy-pasted '<polysimulator-project-uuid>' literally into $PROJECT_FILE
+    instead of your actual UUID. Fix:
+        printf '%s\n' 'YOUR_ACTUAL_UUID' > $PROJECT_FILE
+  - A stale BWS_PROJECT_ID is exported in this shell. Fix:
+        unset BWS_PROJECT_ID && exec \$SHELL
+  - Find your UUID with: BWS_ACCESS_TOKEN=<token> bws project list"
+fi
+export BWS_PROJECT_ID
 
 # ---- locate target repo ---------------------------------------------------
 

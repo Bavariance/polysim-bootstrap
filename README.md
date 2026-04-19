@@ -62,10 +62,15 @@ cd ~/bootstrap
 ./bootstrap/link-configs.sh
 
 # 4. persist your bws machine-account token + project ID
+#    Replace the right-hand side of each printf with your actual values —
+#    do NOT include the angle brackets, they're just placeholders here.
 mkdir -p ~/.config/polysim
-printf '%s\n' '<machine-account-token>' > ~/.config/polysim/bws-token
-printf '%s\n' '<polysimulator-project-uuid>' > ~/.config/polysim/bws-project-id
+TOKEN='paste-your-machine-account-token-here'
+UUID='paste-your-polysimulator-project-uuid-here'
+printf '%s\n' "$TOKEN" > ~/.config/polysim/bws-token
+printf '%s\n' "$UUID"  > ~/.config/polysim/bws-project-id
 chmod 600 ~/.config/polysim/bws-token ~/.config/polysim/bws-project-id
+unset TOKEN UUID
 
 # 5. open a new shell so PATH and BWS_* env vars pick up
 exec $SHELL
