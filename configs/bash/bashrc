@@ -1,38 +1,40 @@
-# ~/.zshrc — interactive shell config. Minimal, no plugin manager.
+# ~/.bashrc — interactive shell config for bash. Mirror of zshrc.
+
+# Skip if not interactive
+case $- in *i*) ;; *) return ;; esac
 
 # ---- history ----------------------------------------------------------------
-HISTFILE="$HOME/.zsh_history"
+HISTFILE="$HOME/.bash_history"
 HISTSIZE=50000
-SAVEHIST=50000
-setopt SHARE_HISTORY HIST_IGNORE_DUPS HIST_IGNORE_SPACE HIST_REDUCE_BLANKS
+HISTFILESIZE=50000
+HISTCONTROL=ignoredups:ignorespace
+shopt -s histappend checkwinsize
 
-# ---- completion -------------------------------------------------------------
-autoload -Uz compinit && compinit -i
-zstyle ':completion:*' menu select
-zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
-
-# ---- prompt (minimal, no external deps) -------------------------------------
-autoload -Uz vcs_info
-precmd() { vcs_info }
-zstyle ':vcs_info:git:*' formats ' (%b)'
-setopt PROMPT_SUBST
-PROMPT='%F{cyan}%n@%m%f %F{yellow}%~%f%F{magenta}${vcs_info_msg_0_}%f %# '
+# ---- prompt (minimal git-aware, no external deps) ---------------------------
+_polysim_git_branch() {
+  local b
+  b="$(git symbolic-ref --short HEAD 2>/dev/null)" \
+    || b="$(git rev-parse --short HEAD 2>/dev/null)" \
+    || return
+  printf ' (%s)' "$b"
+}
+PROMPT_COMMAND='PS1="\[\e[36m\]\u@\h\[\e[0m\] \[\e[33m\]\w\[\e[0m\]\[\e[35m\]$(_polysim_git_branch)\[\e[0m\] \$ "'
 
 # ---- key bindings -----------------------------------------------------------
-bindkey -e
-bindkey '^[[A' history-search-backward
-bindkey '^[[B' history-search-forward
+# Up/Down search history matching what's already typed
+bind '"\e[A": history-search-backward' 2>/dev/null
+bind '"\e[B": history-search-forward'  2>/dev/null
 
 # ---- tools ------------------------------------------------------------------
 
 # fnm (Node version manager)
 if command -v fnm >/dev/null 2>&1; then
-  eval "$(fnm env --shell zsh)"
+  eval "$(fnm env --shell bash)"
 fi
 
 # direnv
 if command -v direnv >/dev/null 2>&1; then
-  eval "$(direnv hook zsh)"
+  eval "$(direnv hook bash)"
 fi
 
 # uv (Python)
@@ -56,4 +58,4 @@ alias gl='git log --oneline --graph --decorate -20'
 command -v fdfind >/dev/null 2>&1 && alias fd=fdfind
 
 # ---- local overrides (gitignored) -------------------------------------------
-[ -r "$HOME/.zshrc.local" ] && . "$HOME/.zshrc.local"
+[ -r "$HOME/.bashrc.local" ] && . "$HOME/.bashrc.local"

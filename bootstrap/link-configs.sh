@@ -38,9 +38,12 @@ link() {
   log "link  $dst → $src"
 }
 
-link "$REPO_ROOT/configs/zsh/zshrc"        "$HOME/.zshrc"
-link "$REPO_ROOT/configs/zsh/zshenv"       "$HOME/.zshenv"
-link "$REPO_ROOT/configs/tmux/tmux.conf"   "$HOME/.tmux.conf"
-link "$REPO_ROOT/configs/direnv/direnvrc"  "$HOME/.config/direnv/direnvrc"
+link "$REPO_ROOT/configs/zsh/zshrc"            "$HOME/.zshrc"
+link "$REPO_ROOT/configs/zsh/zshenv"           "$HOME/.zshenv"
+link "$REPO_ROOT/configs/bash/bashrc"          "$HOME/.bashrc"
+link "$REPO_ROOT/configs/bash/bash_profile"    "$HOME/.bash_profile"
+link "$REPO_ROOT/configs/tmux/tmux.conf"       "$HOME/.tmux.conf"
+link "$REPO_ROOT/configs/direnv/direnvrc"      "$HOME/.config/direnv/direnvrc"
+link "$REPO_ROOT/configs/polysim/shell-init.sh" "$HOME/.config/polysim/shell-init.sh"
 
 log "Done. Open a new shell to pick up the new configs."

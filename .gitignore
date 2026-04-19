@@ -1,4 +1,4 @@
-# --- secrets: never commit anything that could possibly hold one ---
+# --- secrets: never commit anything that could possibly hold one ------------
 *.env
 *.env.*
 .env
@@ -20,17 +20,16 @@ authorized_keys
 .netrc
 .git-credentials
 
-# Bitwarden session/state
-.bw-session
-session.txt
-bw_session
+# --- bws (Bitwarden Secrets Manager) state ----------------------------------
+# These only ever live in ~/.config/polysim/, but block them in-repo too
+# in case someone overrides the config dir to point inside this checkout.
+bws-token
+bws-project-id
+configs/polysim/bws-token
+configs/polysim/bws-project-id
 configs/polysim/*.local.sh
-configs/polysim/env.sh
-configs/polysim/mcp-secrets.sh
-configs/polysim/.bw-session
-configs/polysim/gh-token
 
-# OS / editor cruft
+# --- OS / editor cruft ------------------------------------------------------
 .DS_Store
 .idea/
 .vscode/
@@ -38,6 +37,6 @@ configs/polysim/gh-token
 *.swo
 *~
 
-# Local install logs
+# --- local install / scratch ------------------------------------------------
 *.log
 bootstrap/*.local.sh

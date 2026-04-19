@@ -1,0 +1,4 @@
+# ~/.bash_profile — sourced by login shells (e.g. SSH).
+# Defers to .bashrc so all interactive config lives in one place.
+
+[ -r "$HOME/.bashrc" ] && . "$HOME/.bashrc"

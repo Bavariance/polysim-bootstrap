@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh — deterministic dev-machine setup for Fedora and Ubuntu.
 #
-# Idempotent. Safe to re-run. Does NOT touch secrets — see restore-secrets.sh.
+# Idempotent. Safe to re-run. Does NOT touch secrets — see sync-secrets.sh.
 #
 # Usage:
 #   ./bootstrap/install.sh                 # full install
@@ -157,18 +157,51 @@ if [ "${SKIP_DOCKER:-0}" != "1" ] && ! have docker; then
   fi
 fi
 
-# ---------------------------- Bitwarden CLI ----------------------------------
+# ---------------------------- bws (Bitwarden Secrets Manager CLI) ------------
+#
+# bws is a separate binary from the personal-vault `bw` CLI. Releases use a
+# versioned tag (bws-vX.Y.Z) with no /latest/download/ endpoint, so we query
+# the GitHub API to resolve the current version.
 
-if ! have bw; then
-  log "Installing Bitwarden CLI…"
-  if have npm; then
-    npm install -g @bitwarden/cli
+install_bws() {
+  local dest="${1:-/usr/local/bin}"
+  local tmp
+  tmp="$(mktemp -d)"
+
+  local version
+  version="$(curl -fsSL "https://api.github.com/repos/bitwarden/sdk-sm/releases" \
+    | python3 -c "
+import sys, json
+releases = json.load(sys.stdin)
+tags = [r['tag_name'] for r in releases if r['tag_name'].startswith('bws-v')]
+print(tags[0].replace('bws-v', '')) if tags else sys.exit(1)
+")" || { warn "Could not resolve bws version from GitHub API"; rm -rf "$tmp"; return 1; }
+
+  local arch
+  case "$(uname -m)" in
+    x86_64)  arch="x86_64-unknown-linux-gnu" ;;
+    aarch64) arch="aarch64-unknown-linux-gnu" ;;
+    *)       warn "Unsupported arch for bws: $(uname -m)"; rm -rf "$tmp"; return 1 ;;
+  esac
+
+  local url="https://github.com/bitwarden/sdk-sm/releases/download/bws-v${version}/bws-${arch}-${version}.zip"
+  log "Downloading bws ${version} (${arch})…"
+  curl -fsSL "$url" -o "$tmp/bws.zip" || { warn "bws download failed"; rm -rf "$tmp"; return 1; }
+  unzip -qo "$tmp/bws.zip" bws -d "$tmp" || { warn "bws unzip failed"; rm -rf "$tmp"; return 1; }
+  install -m 0755 "$tmp/bws" "$dest/bws" || { warn "bws install to $dest failed"; rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  log "bws ${version} installed to ${dest}/bws"
+}
+
+if ! have bws; then
+  log "Installing bws (Bitwarden Secrets Manager CLI)…"
+  if [ -w /usr/local/bin ] || { [ -n "$SUDO" ] && $SUDO test -w /usr/local/bin 2>/dev/null; }; then
+    TMP_DEST="$(mktemp -d)"
+    install_bws "$TMP_DEST" && { $SUDO install -m 0755 "$TMP_DEST/bws" /usr/local/bin/bws || true; rm -rf "$TMP_DEST"; }
+    have bws || install_bws "$HOME/.local/bin"
   else
-    BW_TMP="$(mktemp -d)"
-    curl -fsSL "https://vault.bitwarden.com/download/?app=cli&platform=linux" -o "$BW_TMP/bw.zip"
-    unzip -q "$BW_TMP/bw.zip" -d "$BW_TMP"
-    $SUDO install -m 0755 "$BW_TMP/bw" /usr/local/bin/bw
-    rm -rf "$BW_TMP"
+    mkdir -p "$HOME/.local/bin"
+    install_bws "$HOME/.local/bin"
   fi
 fi
 
@@ -194,7 +227,7 @@ fi
 # ---------------------------- summary ----------------------------------------
 
 log "Install complete. Versions:"
-for c in git zsh tmux direnv gh node npm uv bw claude docker; do
+for c in git zsh tmux direnv gh node npm uv bws claude docker; do
   if have "$c"; then
     printf '  %-8s %s\n' "$c" "$("$c" --version 2>&1 | head -1)"
   else
@@ -206,9 +239,16 @@ cat <<EOF
 
 Next steps:
   1. ./bootstrap/link-configs.sh        # symlink shell + tmux + direnv configs
-  2. Set Bitwarden API key env vars, then:
-       ./bootstrap/restore-secrets.sh   # populate ~/.config/polysim/*
-  3. chsh -s "\$(command -v zsh)"       # switch login shell to zsh (optional)
-  4. Open a new shell.
+  2. Persist your Bitwarden Secrets Manager machine-account token:
+       mkdir -p ~/.config/polysim
+       printf '%s\n' '<token>' > ~/.config/polysim/bws-token
+       printf '%s\n' '<project-uuid>' > ~/.config/polysim/bws-project-id
+       chmod 600 ~/.config/polysim/bws-token ~/.config/polysim/bws-project-id
+  3. Clone polysimulator and sync secrets:
+       gh auth login
+       gh repo clone Bavariance/polysimulator ~/projects/polysimulator
+       ./bootstrap/sync-secrets.sh        # writes ~/projects/polysimulator/.env
+  4. chsh -s "\$(command -v zsh)"          # optional, switch login shell
+  5. Open a new shell.
 
 EOF
