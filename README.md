@@ -14,9 +14,9 @@ Manager** via the `bws` CLI.
 
 - **Packages**: `zsh`, `bash`, `tmux`, `git`, `curl`, `direnv`, `jq`, `ripgrep`, `fd`, build tools
 - **Languages / tooling**: Node 22 (via [`fnm`](https://github.com/Schniz/fnm)), [`uv`](https://github.com/astral-sh/uv) for Python, Docker CLI
-- **CLIs**: `gh` (GitHub), `bws` (Bitwarden Secrets Manager), `claude` (Claude Code)
+- **CLIs**: `gh` (GitHub), `bws` (Bitwarden Secrets Manager), `claude` (Claude Code), `zellij` (terminal multiplexer)
 - **VS Code**: Remote-SSH server prerequisites (so opening the host in VS Code "just works")
-- **Configs**: minimal `.zshrc`, `.zshenv`, `.bashrc`, `.bash_profile`, `.tmux.conf`, `direnvrc`
+- **Configs**: minimal `.zshrc`, `.zshenv`, `.bashrc`, `.bash_profile`, `.tmux.conf`, `direnvrc`, zellij config + polysimulator layout
 - **Secrets**: pulled from Bitwarden Secrets Manager into `<polysim-repo>/.env` with `chmod 600`
 
 ---
@@ -38,6 +38,9 @@ $HOME/
   .bashrc, .bash_profile              ← symlinks → bootstrap/configs/bash/*
   .zshrc, .zshenv                     ← symlinks → bootstrap/configs/zsh/*
   .tmux.conf                          ← symlink → bootstrap/configs/tmux/tmux.conf
+  .config/zellij/
+    config.kdl                        ← symlink → bootstrap/configs/zellij/config.kdl
+    layouts/polysimulator.kdl         ← symlink → bootstrap/configs/zellij/layouts/polysimulator.kdl
   projects/
     polysimulator/
       .env                            ← written by sync-secrets.sh, chmod 600, gitignored
@@ -119,6 +122,29 @@ This repo is intentionally **public** — for that to be safe, these rules hold:
 
 If you accidentally commit a secret: rotate it in Bitwarden Secrets Manager
 first, then `git rm` and force-push only after the rotation is live.
+
+---
+
+## Polysimulator zellij workflow
+
+Two shell functions are provisioned in both `~/.bashrc` and `~/.zshrc`:
+
+- `zpoly` — `cd ~/projects/polysimulator && zellij attach polysimulator` (auto-creates
+  the session with the layout if it doesn't exist).
+- `zpoly_reset` — kill the session and recreate it from scratch with the layout.
+
+The layout `configs/zellij/layouts/polysimulator.kdl` defines five tabs: `core`
+(Claude + ops shells), `server` (SSH to your remote VM), `github` (gh issue/pr
+status), `monitor` (ccusage + git status), `backtests`.
+
+The `server` tab SSHes to `${POLYSIM_SERVER_HOST:-hetzner-ashburn1}`. Override
+in `~/.bashrc.local`:
+
+```bash
+export POLYSIM_SERVER_HOST=my-vm-alias
+```
+
+The alias must exist in `~/.ssh/config`.
 
 ---
 

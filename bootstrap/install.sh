@@ -205,6 +205,47 @@ if ! have bws; then
   fi
 fi
 
+# ---------------------------- zellij ----------------------------------------
+#
+# Installs the static musl Linux binary from GitHub releases — same version
+# across Fedora and Ubuntu, no distro-package lag.
+
+install_zellij() {
+  local dest="${1:-/usr/local/bin}"
+  local tmp
+  tmp="$(mktemp -d)"
+
+  local arch
+  case "$(uname -m)" in
+    x86_64)  arch="x86_64-unknown-linux-musl" ;;
+    aarch64) arch="aarch64-unknown-linux-musl" ;;
+    *)       warn "Unsupported arch for zellij: $(uname -m)"; rm -rf "$tmp"; return 1 ;;
+  esac
+
+  local url="https://github.com/zellij-org/zellij/releases/latest/download/zellij-${arch}.tar.gz"
+  log "Downloading zellij (${arch})…"
+  curl -fsSL "$url" -o "$tmp/zellij.tar.gz" \
+    || { warn "zellij download failed"; rm -rf "$tmp"; return 1; }
+  tar -xzf "$tmp/zellij.tar.gz" -C "$tmp" \
+    || { warn "zellij extract failed"; rm -rf "$tmp"; return 1; }
+  install -m 0755 "$tmp/zellij" "$dest/zellij" \
+    || { warn "zellij install to $dest failed"; rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  log "zellij installed to ${dest}/zellij"
+}
+
+if ! have zellij; then
+  log "Installing zellij (terminal multiplexer)…"
+  if [ -w /usr/local/bin ] || { [ -n "$SUDO" ] && $SUDO test -w /usr/local/bin 2>/dev/null; }; then
+    TMP_DEST="$(mktemp -d)"
+    install_zellij "$TMP_DEST" && { $SUDO install -m 0755 "$TMP_DEST/zellij" /usr/local/bin/zellij || true; rm -rf "$TMP_DEST"; }
+    have zellij || install_zellij "$HOME/.local/bin"
+  else
+    mkdir -p "$HOME/.local/bin"
+    install_zellij "$HOME/.local/bin"
+  fi
+fi
+
 # ---------------------------- Claude Code CLI --------------------------------
 
 if ! have claude; then
@@ -227,7 +268,7 @@ fi
 # ---------------------------- summary ----------------------------------------
 
 log "Install complete. Versions:"
-for c in git zsh tmux direnv gh node npm uv bws claude docker; do
+for c in git zsh tmux direnv gh node npm uv bws zellij claude docker; do
   if have "$c"; then
     printf '  %-8s %s\n' "$c" "$("$c" --version 2>&1 | head -1)"
   else

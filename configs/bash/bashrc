@@ -55,7 +55,22 @@ alias ll='ls -lah'
 alias gs='git status'
 alias gd='git diff'
 alias gl='git log --oneline --graph --decorate -20'
+alias xo='xdg-open'
 command -v fdfind >/dev/null 2>&1 && alias fd=fdfind
+
+# ---- zellij polysimulator workflow ------------------------------------------
+# zpoly       — attach existing polysimulator session, or start it with the layout
+# zpoly_reset — kill + recreate polysimulator session from scratch
+zpoly() {
+  cd "$HOME/projects/polysimulator" || return
+  zellij attach polysimulator -c options --default-layout polysimulator
+}
+zpoly_reset() {
+  cd "$HOME/projects/polysimulator" || return
+  zellij kill-session polysimulator 2>/dev/null || true
+  zellij delete-session polysimulator 2>/dev/null || true
+  zellij --new-session-with-layout polysimulator -s polysimulator
+}
 
 # ---- local overrides (gitignored) -------------------------------------------
 [ -r "$HOME/.bashrc.local" ] && . "$HOME/.bashrc.local"

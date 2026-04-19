@@ -1,0 +1,78 @@
+// polysimulator.kdl — zellij layout for the polysimulator dev workflow.
+//
+// Launched by the `zpoly` bash/zsh function (see configs/{bash,zsh}/* in this
+// repo). The function does `cd ~/projects/polysimulator` first so each tab's
+// session inherits that cwd — no hardcoded /home/<user>/ paths needed.
+//
+// SSH host: the "server" tab connects to ${POLYSIM_SERVER_HOST:-hetzner-ashburn1}.
+// Override per-machine in ~/.bashrc.local or ~/.config/polysim/shell-init.local.sh:
+//   export POLYSIM_SERVER_HOST=my-vm-alias
+
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        children
+        pane size=2 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+
+    tab name="core" focus=true split_direction="horizontal" {
+        pane name="claude" split_direction="vertical" size="68%" {
+            pane name="claude-code" command="bash" focus=true start_suspended=true {
+                args "-lc" "claude"
+            }
+        }
+        pane name="ops" split_direction="vertical" size="32%" {
+            pane name="shell"
+            pane name="git"
+            pane name="tests"
+        }
+    }
+
+    tab name="server" split_direction="horizontal" {
+        pane name="app" command="bash" start_suspended=false size="50%" {
+            args "-lc" "ssh ${POLYSIM_SERVER_HOST:-hetzner-ashburn1}"
+        }
+        pane split_direction="vertical" size="50%" {
+            pane name="btop" command="bash" start_suspended=false size="60%" {
+                args "-lc" "ssh -t ${POLYSIM_SERVER_HOST:-hetzner-ashburn1} 'btop; exec bash -l'"
+            }
+            pane name="scratch"
+        }
+    }
+
+    tab name="github" split_direction="horizontal" {
+        pane name="issue-pr-shell" focus=true
+        pane split_direction="vertical" size="40%" {
+            pane name="gh-issues" command="bash" start_suspended=true {
+                args "-lc" "gh issue status"
+            }
+            pane name="gh-prs" command="bash" start_suspended=true {
+                args "-lc" "gh pr status"
+            }
+        }
+    }
+
+    tab name="monitor" split_direction="horizontal" {
+        pane name="usage" command="bash" start_suspended=true size="50%" {
+            args "-lc" "bunx ccusage || npx ccusage@latest || pnpm dlx ccusage"
+        }
+        pane split_direction="vertical" size="50%" {
+            pane name="git-status" command="bash" start_suspended=true {
+                args "-lc" "git status -sb"
+            }
+            pane name="system"
+        }
+    }
+
+    tab name="backtests" split_direction="horizontal" {
+        pane name="runner" focus=true size="65%"
+        pane split_direction="vertical" size="35%" {
+            pane name="data"
+            pane name="results"
+        }
+    }
+}
