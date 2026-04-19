@@ -1,9 +1,9 @@
 # polysim-bootstrap
 
 One-command dev-environment setup for [Polysimulator](https://github.com/Bavariance/polysimulator)
-on Fedora and Ubuntu/Debian. Installs the deterministic toolchain, links shell
-+ tmux + direnv configs, and pulls per-machine secrets from **Bitwarden Secrets
-Manager** via the `bws` CLI.
+on Fedora, Ubuntu/Debian, and **Windows 11 via WSL2**. Installs the deterministic
+toolchain, links shell + tmux + direnv configs, and pulls per-machine secrets
+from **Bitwarden Secrets Manager** via the `bws` CLI.
 
 **No secrets live in this repo.** It is safe to be public. See
 [Security model](#security-model) below.
@@ -92,6 +92,154 @@ BWS_ACCESS_TOKEN=<token> bws project list
 
 ---
 
+## Windows 11 (WSL2)
+
+The bootstrap is bash-only and targets Linux. On Windows, you run it inside
+**WSL2 / Ubuntu 22.04+** — WSL2 is a real Linux kernel, so every step in
+"First-run on a fresh box" works identically once you're in the Ubuntu shell.
+
+### 1. Install WSL2 + Ubuntu
+
+In **PowerShell as Administrator**, once per machine:
+
+```powershell
+wsl --install -d Ubuntu-22.04
+```
+
+Reboot if prompted. On first launch, Ubuntu asks you to set a UNIX username +
+password — use a sensible name (e.g. `wladimir`). The user gets `sudo`
+automatically. Then update packages:
+
+```bash
+sudo apt update && sudo apt upgrade -y
+```
+
+### 2. Install [Windows Terminal](https://aka.ms/terminal) and use it as your default
+
+Windows Terminal supports tabs, true colour, GPU rendering, and works correctly
+with `zellij`. The default `conhost.exe` does not.
+
+### 3. Install Docker
+
+Pick **one**:
+
+- **Docker Desktop for Windows** (recommended for most). Download the installer,
+  enable "Use the WSL 2 based engine" and "Enable integration with Ubuntu-22.04"
+  in Settings → Resources → WSL integration. `docker` and `docker compose`
+  become available inside WSL automatically. Free for organisations with <250
+  employees and <$10M revenue (covers Bavariance).
+- **Native Docker inside WSL**: `sudo apt install docker.io && sudo usermod -aG docker $USER`,
+  then `sudo service docker start` (no systemd autostart in WSL by default).
+  No Windows-side install, but you have to remember to start the daemon.
+
+### 4. Run the standard bootstrap
+
+Inside the Ubuntu shell, follow [First-run on a fresh box](#first-run-on-a-fresh-box)
+exactly as written. The bootstrap auto-detects Ubuntu and uses `apt` paths.
+
+### 5. VSCode + WSL
+
+Install VSCode **on Windows** (not inside WSL), then add these extensions:
+
+- `ms-vscode-remote.remote-wsl` — opens any folder inside WSL as if local
+- `ms-vscode-remote.remote-ssh` — for connecting to the shared Hetzner VM
+
+To open the polysimulator repo:
+
+```bash
+# inside the WSL Ubuntu shell
+cd ~/projects/polysimulator && code .
+```
+
+VSCode launches on Windows, but the language server, terminal, and Claude Code
+extension all run inside WSL.
+
+### 6. SSH key for GitHub
+
+Generate a separate key inside WSL — don't try to share the Windows-side
+Bitwarden Desktop SSH agent (the bridge requires `npiperelay` + `socat` and
+breaks more than it helps for a dev VM):
+
+```bash
+ssh-keygen -t ed25519 -C "wladimir-wsl@bavariance"
+gh ssh-key add ~/.ssh/id_ed25519.pub --title "wladimir-wsl"
+```
+
+Then `gh repo clone …` works for the polysimulator clone in step 6 of the
+standard flow.
+
+### Critical WSL2 gotchas
+
+- **Keep all work inside `~/`, not `/mnt/c/`**. The cross-OS filesystem bridge
+  is ~10–100× slower for small-file operations. `git status` on a polysimulator
+  clone in `/mnt/c/Users/.../projects/` takes seconds; in `~/projects/` it's
+  instant.
+- **`localhost` is shared**. A backend on `localhost:8000` inside WSL is reachable
+  from a browser on Windows — no port forwarding needed.
+- **No systemd autostart** unless you've enabled it. Add `[boot] systemd=true`
+  to `/etc/wsl.conf` and `wsl --shutdown` from PowerShell to enable. Otherwise
+  services like Docker (native, not Desktop) need manual `sudo service docker start`.
+- **Time drift**: WSL2's clock can drift after Windows sleep. If `git`/`docker`
+  complain about timestamps, run `sudo hwclock -s` inside WSL.
+
+---
+
+## bws on Windows / WSL2
+
+`bws` is **only installed inside WSL**, not on Windows. The bootstrap's
+`install.sh` puts the Linux musl binary at `/usr/local/bin/bws` (or
+`~/.local/bin/bws`), and the rest of the flow — `~/.config/polysim/bws-token`,
+`sync-secrets.sh`, the auto-export from `shell-init.sh` — works identically to
+native Linux.
+
+You don't need the Windows-native `bws.exe` for our setup. If you ever want it
+in PowerShell separately, Bitwarden ships a `bws-x86_64-pc-windows-msvc-*.zip`
+in the same GitHub releases.
+
+### Where the BWS_ACCESS_TOKEN lives on Wladimir's machine
+
+Two places, both safe:
+
+1. **Personal Bitwarden vault on Windows** (the desktop app, not Secrets
+   Manager): store the machine-account token as a secure note named e.g.
+   `polysim/bws-machine-token-wsl-<hostname>`. Copy it into WSL during
+   bootstrap step 4. This is the long-term home — if the laptop dies, you
+   can re-bootstrap a new one from any device that has access to the vault.
+2. **Inside WSL at `~/.config/polysim/bws-token`** (chmod 600): the working
+   copy. Lives on the WSL ext4 filesystem (`\\wsl$\Ubuntu-22.04\home\<user>\…`),
+   so it's isolated from Windows-side processes by default and never crosses
+   the OS boundary.
+
+### One machine-account token per developer-machine
+
+Best practice: each developer creates **their own** machine account in
+`sm.bitwarden.com` (one machine account per laptop, not one shared across the
+team). Reasons:
+
+- If Wladimir's laptop is lost or compromised, you revoke just his token in the
+  bws web UI without affecting yours.
+- Audit log shows who pulled secrets when.
+- Token rotation is per-machine, no team coordination needed.
+
+Both machine accounts get **read-only** access to the same `polysimulator`
+project — they pull identical secrets, just authenticate as different
+principals.
+
+### Rotating the token on WSL
+
+Same flow as Linux:
+
+```bash
+# After generating a new machine-account token in sm.bitwarden.com:
+printf '%s\n' '<new-token>' > ~/.config/polysim/bws-token
+chmod 600 ~/.config/polysim/bws-token
+exec $SHELL                     # picks up the new token via shell-init.sh
+bws secret list                 # verify it works
+~/bootstrap/bootstrap/sync-secrets.sh   # refresh ~/projects/polysimulator/.env
+```
+
+---
+
 ## Re-running
 
 All scripts are **idempotent**:
@@ -162,8 +310,9 @@ The alias must exist in `~/.ssh/config`.
 
 - **Fedora** 40+ (uses `dnf`)
 - **Ubuntu** 22.04+, **Debian** 12+ (uses `apt`)
+- **Windows 11** via [WSL2 / Ubuntu 22.04+](#windows-11-wsl2)
 
-Architectures: `x86_64` and `aarch64` (bws install handles both).
+Architectures: `x86_64` and `aarch64` (bws + zellij installs handle both).
 
 ---
 
