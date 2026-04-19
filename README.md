@@ -33,6 +33,7 @@ $HOME/
   .config/polysim/                    ← chmod 700
     bws-token                         ← chmod 600, gitignored (machine account token)
     bws-project-id                    ← chmod 600, gitignored (UUID of the bws project)
+    bws-server-url                    ← chmod 600, gitignored (only if on Bitwarden EU)
     shell-init.sh                     ← symlink → bootstrap/configs/polysim/shell-init.sh
   .ssh/
   .bashrc, .bash_profile              ← symlinks → bootstrap/configs/bash/*
@@ -71,6 +72,11 @@ printf '%s\n' "$TOKEN" > ~/.config/polysim/bws-token
 printf '%s\n' "$UUID"  > ~/.config/polysim/bws-project-id
 chmod 600 ~/.config/polysim/bws-token ~/.config/polysim/bws-project-id
 unset TOKEN UUID
+
+# 4b. ONLY if your Bitwarden account is on the EU instance (Bavariance is):
+#     Skip this if you log in at vault.bitwarden.com (US default).
+echo 'https://vault.bitwarden.eu' > ~/.config/polysim/bws-server-url
+chmod 600 ~/.config/polysim/bws-server-url
 
 # 5. open a new shell so PATH and BWS_* env vars pick up
 exec $SHELL

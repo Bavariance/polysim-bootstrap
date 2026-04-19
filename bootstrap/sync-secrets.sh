@@ -59,6 +59,7 @@ esac
 CFG_DIR="$HOME/.config/polysim"
 TOKEN_FILE="$CFG_DIR/bws-token"
 PROJECT_FILE="$CFG_DIR/bws-project-id"
+SERVER_URL_FILE="$CFG_DIR/bws-server-url"
 
 # Strip surrounding whitespace + a single leading `<` / trailing `>` (common
 # copy-paste mistake when users paste the README's `<placeholder>` literally).
@@ -76,6 +77,14 @@ if [ -z "${BWS_ACCESS_TOKEN:-}" ] && [ -r "$TOKEN_FILE" ]; then
 fi
 BWS_ACCESS_TOKEN="$(sanitize "${BWS_ACCESS_TOKEN:-}")"
 export BWS_ACCESS_TOKEN
+
+# ---- resolve server URL (default US, EU users override) -------------------
+
+if [ -z "${BWS_SERVER_URL:-}" ] && [ -r "$SERVER_URL_FILE" ]; then
+  BWS_SERVER_URL="$(cat "$SERVER_URL_FILE")"
+fi
+BWS_SERVER_URL="$(sanitize "${BWS_SERVER_URL:-}")"
+[ -n "$BWS_SERVER_URL" ] && export BWS_SERVER_URL
 
 if [ -z "${BWS_ACCESS_TOKEN:-}" ]; then
   die "BWS_ACCESS_TOKEN not set and $TOKEN_FILE not found.
@@ -133,6 +142,7 @@ OUT_FILE="$REPO_DIR/.env"
 # ---- fetch secrets --------------------------------------------------------
 
 log "Environment: $ENV_NAME"
+log "Server URL:  ${BWS_SERVER_URL:-https://vault.bitwarden.com (default)}"
 log "Fetching secrets from bws (project $BWS_PROJECT_ID)…"
 SECRETS_ENV="$(bws secret list -o env "$BWS_PROJECT_ID" 2>&1)" \
   || die "bws fetch failed:

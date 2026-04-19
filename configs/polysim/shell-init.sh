@@ -28,4 +28,13 @@ if [ -r "$_polysim_project_file" ]; then
 fi
 unset _polysim_project_file
 
+# Auto-export BWS_SERVER_URL for non-US Bitwarden instances (e.g. EU).
+# Defaults to https://vault.bitwarden.com if the file is absent.
+_polysim_server_file="$HOME/.config/polysim/bws-server-url"
+if [ -r "$_polysim_server_file" ]; then
+  BWS_SERVER_URL="$(_polysim_clean "$(cat "$_polysim_server_file")")"
+  [ -n "$BWS_SERVER_URL" ] && export BWS_SERVER_URL
+fi
+unset _polysim_server_file
+
 unset -f _polysim_clean 2>/dev/null || true
