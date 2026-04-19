@@ -3,6 +3,30 @@
 # Skip if not interactive
 case $- in *i*) ;; *) return ;; esac
 
+# ---- bash-completion (programmable tab-complete for git, gh, docker, …) -----
+# Debian auto-sources /etc/bash.bashrc which usually does this; Fedora doesn't.
+# Sourcing explicitly here is harmless on both and guarantees completion works.
+if ! shopt -oq posix; then
+  if [ -r /usr/share/bash-completion/bash_completion ]; then
+    . /usr/share/bash-completion/bash_completion
+  elif [ -r /etc/bash_completion ]; then
+    . /etc/bash_completion
+  fi
+fi
+
+# ---- friendlier defaults (lesspipe, ls/grep colors) -------------------------
+[ -x /usr/bin/lesspipe ] && eval "$(SHELL=/bin/sh lesspipe)"
+
+if [ -x /usr/bin/dircolors ]; then
+  test -r "$HOME/.dircolors" \
+    && eval "$(dircolors -b "$HOME/.dircolors")" \
+    || eval "$(dircolors -b)"
+  alias ls='ls --color=auto'
+  alias grep='grep --color=auto'
+  alias fgrep='fgrep --color=auto'
+  alias egrep='egrep --color=auto'
+fi
+
 # ---- history ----------------------------------------------------------------
 HISTFILE="$HOME/.bash_history"
 HISTSIZE=50000
