@@ -79,6 +79,7 @@ COMMON_PKGS=(
   postgresql-client                # psql, for talking to Supabase
   redis-tools                      # redis-cli, for inspecting Redis
   btop                             # system monitor (used by zellij layout)
+  keychain                         # persistent ssh-agent across shell sessions
 )
 
 # Translate apt names → dnf names where they differ.
@@ -93,6 +94,7 @@ if [ "$PKG" = "dnf" ]; then
     postgresql                     # provides psql on Fedora
     redis                          # provides redis-cli
     btop
+    keychain
   )
 fi
 
@@ -376,6 +378,20 @@ if ! have perplexity-comet-mcp; then
   fi
 fi
 
+# ---------------------------- context7 MCP server ----------------------------
+#
+# Upstash's context7 fetches up-to-date library docs. Referenced by both
+# .mcp.json and .vscode/mcp.json via `npx -y @upstash/context7-mcp`; a global
+# install makes first-launch ~3s faster and lets npx find it locally.
+
+if ! have context7-mcp; then
+  log "Installing @upstash/context7-mcp…"
+  if have npm; then
+    npm install -g @upstash/context7-mcp \
+      || warn "context7-mcp install failed — npx -y fallback still works"
+  fi
+fi
+
 # ---------------------------- VS Code Remote prereqs -------------------------
 
 # vscode-server unpacks to ~/.vscode-server and needs glibc, gcompat (musl), tar.
@@ -391,7 +407,7 @@ log "Install complete. Versions:"
 # Some tools (notably stdio MCP servers like perplexity-comet-mcp) don't
 # recognize --version and block waiting for stdio input — wrap each check
 # in a 2s timeout so one misbehaving binary can't hang the whole script.
-for c in git zsh tmux direnv gh node npm uv bun bws zellij claude docker stripe psql redis-cli btop mcp-grafana perplexity-comet-mcp; do
+for c in git zsh tmux direnv gh node npm uv bun bws zellij claude docker stripe psql redis-cli btop keychain mcp-grafana perplexity-comet-mcp context7-mcp; do
   if have "$c"; then
     v="$(timeout 2 "$c" --version 2>&1 | head -1 || true)"
     [ -n "$v" ] || v="(installed; no --version output)"

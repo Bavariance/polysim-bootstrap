@@ -38,3 +38,20 @@ fi
 unset _polysim_server_file
 
 unset -f _polysim_clean 2>/dev/null || true
+
+# Persistent ssh-agent via keychain — prompts once per machine-uptime for any
+# passphrase-protected key, then caches for all future shells. Silent when
+# keychain isn't installed so this file stays safe on minimal systems.
+# Auto-discovers all key pairs in ~/.ssh/ (anything with a matching .pub).
+if command -v keychain >/dev/null 2>&1 && [ -d "$HOME/.ssh" ]; then
+  _polysim_keys=""
+  for _pub in "$HOME/.ssh"/*.pub; do
+    [ -r "$_pub" ] || continue
+    _priv="${_pub%.pub}"
+    [ -r "$_priv" ] && _polysim_keys="$_polysim_keys $_priv"
+  done
+  if [ -n "$_polysim_keys" ]; then
+    eval "$(keychain --quiet --eval --agents ssh $_polysim_keys)"
+  fi
+  unset _polysim_keys _pub _priv
+fi
