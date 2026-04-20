@@ -361,6 +361,21 @@ if ! have claude; then
   npm install -g @anthropic-ai/claude-code
 fi
 
+# ---------------------------- perplexity-comet-mcp ---------------------------
+#
+# Stdio MCP server referenced by polysimulator/.mcp.json as `perplexity-comet`.
+# Without this binary Claude Code reports the server as failed on every startup.
+
+if ! have perplexity-comet-mcp; then
+  log "Installing perplexity-comet-mcp…"
+  if have npm; then
+    npm install -g perplexity-comet-mcp \
+      || warn "perplexity-comet-mcp install failed — skip if you don't use the Perplexity MCP"
+  else
+    warn "npm not on PATH — cannot install perplexity-comet-mcp"
+  fi
+fi
+
 # ---------------------------- VS Code Remote prereqs -------------------------
 
 # vscode-server unpacks to ~/.vscode-server and needs glibc, gcompat (musl), tar.
@@ -373,7 +388,7 @@ fi
 # ---------------------------- summary ----------------------------------------
 
 log "Install complete. Versions:"
-for c in git zsh tmux direnv gh node npm uv bun bws zellij claude docker stripe psql redis-cli btop mcp-grafana; do
+for c in git zsh tmux direnv gh node npm uv bun bws zellij claude docker stripe psql redis-cli btop mcp-grafana perplexity-comet-mcp; do
   if have "$c"; then
     printf '  %-8s %s\n' "$c" "$("$c" --version 2>&1 | head -1)"
   else
