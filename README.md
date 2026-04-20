@@ -90,13 +90,22 @@ gh repo clone Bavariance/polysimulator ~/projects/polysimulator
 # 7. pull secrets into <polysim-repo>/.env
 ./bootstrap/sync-secrets.sh
 
-# 8. (optional) make zsh the login shell
+# 8. trust the polysimulator .envrc so direnv loads the new .env into your shell
+#    (one-time per machine per repo — direnv refuses to source untrusted files
+#    by default, which is good security; you're vouching that .envrc only does
+#    `dotenv_if_exists .env` and isn't running anything malicious).
+cd ~/projects/polysimulator && direnv allow .
+
+# 9. (optional) make zsh the login shell
 chsh -s "$(command -v zsh)"
 ```
 
 After step 5, `bws secret list` and `bws project list` work without any
-manual `export`. After step 7, `cd ~/projects/polysimulator && docker compose
-up --build` Just Works.
+manual `export`. After step 7, `docker compose up --build` from inside the
+polysimulator directory Just Works (compose reads `.env` directly via
+`env_file:`). After step 8, `claude` and VSCode launched from inside the
+repo see all the MCP secrets in their environment — without it, Claude Code
+will report `supabase`, `grafana`, and `dokploy` MCP servers as failed.
 
 To find your project UUID before step 4:
 ```bash
@@ -262,6 +271,8 @@ All scripts are **idempotent**:
 - `sync-secrets.sh`   — re-pulls latest secrets, atomically replaces `<polysim-repo>/.env`
 
 Run `sync-secrets.sh` whenever a secret rotates in Bitwarden Secrets Manager.
+You do **not** need to re-run `direnv allow .` — direnv stays trusting the
+same `.envrc` until its content changes (then it asks you to re-allow once).
 
 ---
 
