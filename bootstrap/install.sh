@@ -392,6 +392,20 @@ if ! have context7-mcp; then
   fi
 fi
 
+# ---------------------------- supabase MCP server ----------------------------
+#
+# Official @supabase/mcp-server-supabase. stdio transport, authenticates via
+# SUPABASE_ACCESS_TOKEN (PAT). Pre-installing avoids the ~3s npx cold-start
+# on every first MCP session on a new machine.
+
+if ! have mcp-server-supabase; then
+  log "Installing @supabase/mcp-server-supabase…"
+  if have npm; then
+    npm install -g @supabase/mcp-server-supabase \
+      || warn "mcp-server-supabase install failed — npx -y fallback still works"
+  fi
+fi
+
 # ---------------------------- VS Code Remote prereqs -------------------------
 
 # vscode-server unpacks to ~/.vscode-server and needs glibc, gcompat (musl), tar.
@@ -407,7 +421,7 @@ log "Install complete. Versions:"
 # Some tools (notably stdio MCP servers like perplexity-comet-mcp) don't
 # recognize --version and block waiting for stdio input — wrap each check
 # in a 2s timeout so one misbehaving binary can't hang the whole script.
-for c in git zsh tmux direnv gh node npm uv bun bws zellij claude docker stripe psql redis-cli btop keychain mcp-grafana perplexity-comet-mcp context7-mcp; do
+for c in git zsh tmux direnv gh node npm uv bun bws zellij claude docker stripe psql redis-cli btop keychain mcp-grafana perplexity-comet-mcp context7-mcp mcp-server-supabase; do
   if have "$c"; then
     v="$(timeout 2 "$c" --version 2>&1 | head -1 || true)"
     [ -n "$v" ] || v="(installed; no --version output)"
