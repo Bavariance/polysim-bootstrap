@@ -388,11 +388,16 @@ fi
 # ---------------------------- summary ----------------------------------------
 
 log "Install complete. Versions:"
+# Some tools (notably stdio MCP servers like perplexity-comet-mcp) don't
+# recognize --version and block waiting for stdio input — wrap each check
+# in a 2s timeout so one misbehaving binary can't hang the whole script.
 for c in git zsh tmux direnv gh node npm uv bun bws zellij claude docker stripe psql redis-cli btop mcp-grafana perplexity-comet-mcp; do
   if have "$c"; then
-    printf '  %-8s %s\n' "$c" "$("$c" --version 2>&1 | head -1)"
+    v="$(timeout 2 "$c" --version 2>&1 | head -1 || true)"
+    [ -n "$v" ] || v="(installed; no --version output)"
+    printf '  %-20s %s\n' "$c" "$v"
   else
-    printf '  %-8s (not installed)\n' "$c"
+    printf '  %-20s (not installed)\n' "$c"
   fi
 done
 
