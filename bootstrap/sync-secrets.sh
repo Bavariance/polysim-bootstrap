@@ -7,6 +7,12 @@
 #   2. <polysim-repo>/.env.defaults.<env>        (env-specific, optional)
 #   3. bws secret list -o env                    (secrets, always — highest precedence)
 #
+# SSH key routing (multi-line values that would break direnv's .env parser):
+#   SSH_KEY_<name>  →  ~/.ssh/<name>      (chmod 600, private key)
+#   SSH_PUB_<name>  →  ~/.ssh/<name>.pub  (chmod 644, public key)
+# <name> is lowercased for the filename. These secrets are excluded from .env
+# and consumed by ssh-agent (auto-loaded via keychain in shell-init.sh).
+#
 # Usage:
 #   ./bootstrap/sync-secrets.sh                  # default: --env dev
 #   ./bootstrap/sync-secrets.sh --env prod
@@ -98,6 +104,8 @@ fi
 
 command -v bws >/dev/null 2>&1 \
   || die "bws not installed — run ./bootstrap/install.sh first"
+command -v jq >/dev/null 2>&1 \
+  || die "jq not installed — run ./bootstrap/install.sh first (or apt-get install jq)"
 
 # ---- resolve project id ---------------------------------------------------
 
@@ -144,13 +152,74 @@ OUT_FILE="$REPO_DIR/.env"
 log "Environment: $ENV_NAME"
 log "Server URL:  ${BWS_SERVER_URL:-https://vault.bitwarden.com (default)}"
 log "Fetching secrets from bws (project $BWS_PROJECT_ID)…"
-SECRETS_ENV="$(bws secret list -o env "$BWS_PROJECT_ID" 2>&1)" \
+SECRETS_JSON="$(bws secret list -o json "$BWS_PROJECT_ID" 2>&1)" \
   || die "bws fetch failed:
-$SECRETS_ENV"
+$SECRETS_JSON"
 
-SECRET_COUNT="$(printf '%s\n' "$SECRETS_ENV" | grep -cE '^[A-Z_][A-Z0-9_]*=' || true)"
-[ "$SECRET_COUNT" -gt 0 ] \
+printf '%s' "$SECRETS_JSON" | jq empty >/dev/null 2>&1 \
+  || die "bws returned non-JSON output:
+$SECRETS_JSON"
+
+TOTAL_COUNT="$(printf '%s' "$SECRETS_JSON" | jq 'length')"
+[ "$TOTAL_COUNT" -gt 0 ] \
   || die "bws returned 0 secrets — check the project ID and machine-account access"
+
+ENV_COUNT="$(printf '%s' "$SECRETS_JSON" \
+  | jq '[.[] | select(.key | test("^SSH_(KEY|PUB)_") | not)] | length')"
+SSH_COUNT="$(printf '%s' "$SECRETS_JSON" \
+  | jq '[.[] | select(.key | test("^SSH_(KEY|PUB)_"))] | length')"
+
+# Warn on multi-line non-SSH secrets — they'll break direnv's .env parser.
+MULTILINE_KEYS="$(printf '%s' "$SECRETS_JSON" \
+  | jq -r '.[] | select(.key | test("^SSH_(KEY|PUB)_") | not)
+                | select(.value | contains("\n")) | .key')"
+if [ -n "$MULTILINE_KEYS" ]; then
+  warn "Multi-line non-SSH secrets detected — direnv will fail to load .env:"
+  printf '%s\n' "$MULTILINE_KEYS" | sed 's/^/  - /' >&2
+  warn "Rename them to SSH_KEY_<name> or SSH_PUB_<name> to route them to ~/.ssh/ instead."
+fi
+
+# ---- write SSH key files ---------------------------------------------------
+
+if [ "$SSH_COUNT" -gt 0 ]; then
+  SSH_DIR="$HOME/.ssh"
+  mkdir -p "$SSH_DIR"
+  chmod 700 "$SSH_DIR"
+
+  SSH_WRITTEN=""
+  # Stream one base64-encoded JSON blob per SSH secret so multi-line values
+  # survive the shell loop intact.
+  while IFS= read -r _row; do
+    [ -n "$_row" ] || continue
+    _decoded="$(printf '%s' "$_row" | base64 -d)"
+    _skey="$(printf '%s' "$_decoded" | jq -r '.key')"
+    _sval="$(printf '%s' "$_decoded" | jq -r '.value')"
+
+    case "$_skey" in
+      SSH_KEY_*) _suffix="";      _mode=600; _raw="${_skey#SSH_KEY_}" ;;
+      SSH_PUB_*) _suffix=".pub";  _mode=644; _raw="${_skey#SSH_PUB_}" ;;
+      *)         continue ;;
+    esac
+
+    if [ -z "$_raw" ]; then
+      warn "Skipping malformed SSH secret (empty name after prefix): $_skey"
+      continue
+    fi
+
+    _fname="$(printf '%s' "$_raw" | tr '[:upper:]' '[:lower:]')${_suffix}"
+    _target="$SSH_DIR/$_fname"
+    _tmp_target="$(mktemp "${_target}.sync.XXXXXX")"
+    # Strip one trailing newline (if present) and add exactly one — OpenSSH
+    # requires the file to end with a newline.
+    printf '%s\n' "${_sval%$'\n'}" > "$_tmp_target"
+    chmod "$_mode" "$_tmp_target"
+    mv "$_tmp_target" "$_target"
+    SSH_WRITTEN="$SSH_WRITTEN $_fname"
+  done < <(printf '%s' "$SECRETS_JSON" \
+    | jq -r '.[] | select(.key | test("^SSH_(KEY|PUB)_")) | @base64')
+
+  log "Wrote $SSH_COUNT ssh key file(s) to $SSH_DIR:$SSH_WRITTEN"
+fi
 
 # ---- write .env atomically -------------------------------------------------
 
@@ -166,7 +235,7 @@ trap 'rm -f "$TMP"' EXIT
   printf '# Layered (last wins for duplicate keys):\n'
   printf '#   1. .env.defaults                  (env-agnostic)\n'
   printf '#   2. .env.defaults.%s               (env-specific)\n' "$ENV_NAME"
-  printf '#   3. bws secret list -o env         (secrets)\n'
+  printf '#   3. bws secrets                    (env vars; SSH_KEY_*/SSH_PUB_* → ~/.ssh/)\n'
   printf '#\n'
   printf '# Environment: %s\n' "$ENV_NAME"
   printf '# bws project: %s\n' "$BWS_PROJECT_ID"
@@ -188,13 +257,17 @@ trap 'rm -f "$TMP"' EXIT
     printf '# (no %s found — skipping env-specific defaults layer)\n\n' "$(basename "$ENV_DEFAULTS_FILE")"
   fi
 
-  printf '# ====== secrets from bws ======\n'
-  printf '%s\n' "$SECRETS_ENV" | grep -E '^[A-Z_][A-Z0-9_]*=' | LC_ALL=C sort
+  printf '# ====== secrets from bws (SSH_KEY_*/SSH_PUB_* routed to ~/.ssh/) ======\n'
+  printf '%s' "$SECRETS_JSON" | jq -r '
+    [.[] | select(.key | test("^SSH_(KEY|PUB)_") | not)]
+    | sort_by(.key) | .[]
+    | "\(.key)=\(.value)"
+  '
 } > "$TMP"
 
 mv "$TMP" "$OUT_FILE"
 chmod 600 "$OUT_FILE"
 trap - EXIT
 
-log "Wrote $OUT_FILE ($SECRET_COUNT secrets, $(wc -l < "$OUT_FILE") total lines, chmod 600)"
-log "Done. 'docker compose up' will pick up the new env."
+log "Wrote $OUT_FILE ($ENV_COUNT env secrets, $(wc -l < "$OUT_FILE") total lines, chmod 600)"
+log "Done. 'docker compose up' will pick up the new env; ssh-agent picks up keys on next shell."

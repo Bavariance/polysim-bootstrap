@@ -276,6 +276,38 @@ same `.envrc` until its content changes (then it asks you to re-allow once).
 
 ---
 
+## SSH keys via bws
+
+Private keys are multi-line, which direnv's `.env` parser can't handle. Name
+SSH secrets in bws with a reserved prefix and `sync-secrets.sh` will route
+them out of `.env` and straight into `~/.ssh/` as real files:
+
+| bws secret key            | Destination file            | Mode |
+| ------------------------- | --------------------------- | ---- |
+| `SSH_KEY_<name>`          | `~/.ssh/<name>`             | 600  |
+| `SSH_PUB_<name>`          | `~/.ssh/<name>.pub`         | 644  |
+
+`<name>` is lowercased for the filename (e.g. `SSH_KEY_HETZNER_DEPLOY` →
+`~/.ssh/hetzner_deploy`). The paired `shell-init.sh` auto-discovers any
+`~/.ssh/<name>` + matching `.pub` and loads it into `ssh-agent` via
+`keychain` on the next shell — so after a `sync-secrets.sh` run and a fresh
+shell, `ssh <host>` works with no further setup.
+
+Reference the key from `~/.ssh/config` as usual:
+
+```
+Host hetzner-ashburn1
+  HostName <ip-or-dns>
+  User <user>
+  IdentityFile ~/.ssh/hetzner_deploy
+```
+
+Any non-SSH secret whose value contains a newline triggers a `[warn]` —
+rename it to `SSH_KEY_<name>` / `SSH_PUB_<name>` so it's written as a file
+instead of trying to squeeze into `.env`.
+
+---
+
 ## Security model
 
 This repo is intentionally **public** — for that to be safe, these rules hold:
