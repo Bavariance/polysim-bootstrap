@@ -31,11 +31,14 @@ $HOME/
     bootstrap/install.sh
     bootstrap/link-configs.sh
     bootstrap/sync-secrets.sh
+    bootstrap/sync-dokploy-env.sh     ← pushes .env.defaults* to Dokploy panels
     configs/{bash,zsh,tmux,direnv,polysim}/
   .config/polysim/                    ← chmod 700
     bws-token                         ← chmod 600, gitignored (machine account token)
     bws-project-id                    ← chmod 600, gitignored (UUID of the bws project)
     bws-server-url                    ← chmod 600, gitignored (only if on Bitwarden EU)
+    dokploy-api-key                   ← chmod 600, gitignored (used by sync-dokploy-env.sh)
+    dokploy-url                       ← chmod 600, gitignored (defaults to hosting.wladefant.de/api)
     shell-init.sh                     ← symlink → bootstrap/configs/polysim/shell-init.sh
   .ssh/
   .bashrc, .bash_profile              ← symlinks → bootstrap/configs/bash/*
@@ -266,13 +269,89 @@ bws secret list                 # verify it works
 
 All scripts are **idempotent**:
 
-- `install.sh`        — re-checks each tool, installs only what's missing
-- `link-configs.sh`   — leaves correct symlinks alone, backs up real files to `*.bak-<timestamp>`
-- `sync-secrets.sh`   — re-pulls latest secrets, atomically replaces `<polysim-repo>/.env`
+- `install.sh`             — re-checks each tool, installs only what's missing
+- `link-configs.sh`        — leaves correct symlinks alone, backs up real files to `*.bak-<timestamp>`
+- `sync-secrets.sh`        — re-pulls latest secrets, atomically replaces `<polysim-repo>/.env`
+- `sync-dokploy-env.sh`    — pushes `.env.defaults*` from the polysim repo to the matching Dokploy compose's environment-variables panel
 
 Run `sync-secrets.sh` whenever a secret rotates in Bitwarden Secrets Manager.
 You do **not** need to re-run `direnv allow .` — direnv stays trusting the
 same `.envrc` until its content changes (then it asks you to re-allow once).
+
+---
+
+## Pushing `.env.defaults*` to Dokploy compose panels
+
+`sync-secrets.sh` writes secrets to the **local** `.env` for `docker compose
+up` on your dev box. That's not what runs in production — Dokploy reads its
+own per-compose env-variables panel at deploy time.
+
+`sync-dokploy-env.sh` closes that loop. It reads the same layered defaults
+files (`.env.defaults` + `.env.defaults.<env>`), then **merges** the keys
+into the corresponding Dokploy compose panel — leaving every key not in the
+defaults (typically bws-managed secrets) untouched.
+
+### One-time setup
+
+Drop a Dokploy machine-account API key (with `compose.update` + `compose.one`
++ `compose.redeploy` scopes) into `~/.config/polysim/dokploy-api-key`:
+
+```bash
+mkdir -p ~/.config/polysim
+printf '%s\n' '<dokploy-api-key>' > ~/.config/polysim/dokploy-api-key
+chmod 600 ~/.config/polysim/dokploy-api-key
+```
+
+Override the Dokploy server URL only if you're not on the
+default `https://hosting.wladefant.de/api`:
+
+```bash
+printf '%s\n' '<your-dokploy-url>' > ~/.config/polysim/dokploy-url
+chmod 600 ~/.config/polysim/dokploy-url
+```
+
+### Daily flow
+
+```bash
+# 1. Edit .env.defaults.<env> in the polysimulator repo, commit + push.
+# 2. After the staging branch deploys, sync the panel for the relevant compose:
+~/bootstrap/bootstrap/sync-dokploy-env.sh --env staging-api --dry-run
+# Inspect the diff:
+#   + NEW_KEY=value
+#   ~ EXISTING_KEY: old → new
+#   = UNCHANGED_KEY (printed only as a count)
+
+# 3. Apply:
+~/bootstrap/bootstrap/sync-dokploy-env.sh --env staging-api
+
+# 4. Optionally redeploy the compose so the new env takes effect immediately:
+~/bootstrap/bootstrap/sync-dokploy-env.sh --env staging-api --redeploy
+```
+
+### Compose mapping baked into the script
+
+| `--env` | composeId | name |
+|---|---|---|
+| `prod` | `qCKlu4fStE0xLfZRCKUdw` | Production |
+| `staging` | `nG8qoVvsNNaMyycQ-OVZc` | Staging (Frankfurt) |
+| `staging-api` | `D7D0CWyem5CjJi2bTegfZ` | Staging-API (US-East) |
+| `staging3` | `7zxtKuQLxU9Po8GmtMbJh` | Staging3 (US-East) |
+
+Override with `--compose-id <id>` for new composes not in the table.
+
+### What lives where
+
+| Layer | Source of truth | Consumed by |
+|---|---|---|
+| Public defaults (per-env tunables, non-secret) | `polysimulator/.env.defaults*` | `sync-dokploy-env.sh` → Dokploy panel; `sync-secrets.sh` → local `.env` |
+| Secrets (API keys, JWT secret, Stripe keys, etc.) | Bitwarden Secrets Manager | `sync-secrets.sh` → local `.env`; **manually** entered in Dokploy panel — `sync-dokploy-env.sh` does NOT push secrets |
+| Inline compose fallbacks | `docker-compose.*.yml` `${VAR:-default}` | Used only when the panel doesn't set the var; safety net for misconfigured panels |
+
+`sync-dokploy-env.sh` deliberately leaves bws-managed secrets in the panel
+untouched — even if the Dokploy panel has them hand-entered, the merge
+preserves them. The only divergence the script removes is between
+`.env.defaults*` and the Dokploy panel, and only for the keys
+explicitly listed in the defaults files.
 
 ---
 
