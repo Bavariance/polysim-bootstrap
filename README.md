@@ -293,8 +293,32 @@ defaults (typically bws-managed secrets) untouched.
 
 ### One-time setup
 
-Drop a Dokploy machine-account API key (with `compose.update` + `compose.one`
-+ `compose.redeploy` scopes) into `~/.config/polysim/dokploy-api-key`:
+The script resolves the Dokploy API key in this order — first hit wins:
+
+1. **`$DOKPLOY_API_KEY` env var** (manual override).
+2. **bws** — secret named `DOKPLOY_API_KEY` in your configured project.
+   This is the recommended path: if your host is already running
+   `sync-secrets.sh` (so `~/.config/polysim/bws-token` and
+   `bws-project-id` exist), there is **no extra setup**. Override the
+   secret name with `--bws-key=<NAME>`, or skip bws entirely with
+   `--no-bws`.
+3. **`~/.config/polysim/dokploy-api-key`** — legacy plaintext fallback.
+
+So in practice, on a host that's already bws-bootstrapped:
+
+```bash
+# Nothing to do. The script will pull DOKPLOY_API_KEY from bws on first run.
+~/bootstrap/bootstrap/sync-dokploy-env.sh --env staging-api --dry-run
+```
+
+If bws isn't an option (e.g. on a CI runner without machine-account
+access), fall back to either the env var:
+
+```bash
+DOKPLOY_API_KEY=<token> ~/bootstrap/bootstrap/sync-dokploy-env.sh --env staging-api
+```
+
+…or the legacy file:
 
 ```bash
 mkdir -p ~/.config/polysim
