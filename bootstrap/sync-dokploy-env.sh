@@ -142,12 +142,17 @@ Did you typo --env? Available defaults files:
 parse_env_file() {
   local f="$1"
   [ -r "$f" ] || return 0
+  # Use POSIX awk only — `gawk`-isms (asorti, gensub) break on mawk/busybox.
   awk '
     /^[[:space:]]*#/    { next }
     /^[[:space:]]*$/    { next }
     /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=/ {
-      # Strip leading whitespace but keep the value intact.
+      # Strip leading whitespace, then any whitespace immediately
+      # before `=` so `FOO =bar` becomes `FOO=bar` (otherwise the key
+      # would be `FOO ` with a trailing space, never matching the
+      # Dokploy panel and creating a phantom variable).
       sub(/^[[:space:]]+/, "")
+      sub(/[[:space:]]+=/, "=")
       print
       next
     }
@@ -156,6 +161,12 @@ parse_env_file() {
 
 # Stable join of env-var lines, with later values winning duplicate keys.
 # Stdin: KEY=VALUE per line. Stdout: KEY=VALUE per line, sorted by key.
+#
+# Sorting is delegated to `LC_ALL=C sort` so we don't depend on
+# `asorti()` (a gawk-only extension; mawk is the default `awk` on
+# Ubuntu/Debian and would crash with `function asorti never defined`).
+# Sorting `KEY=VALUE` lines by full-line ASCII order is equivalent to
+# sorting by key, since `=` is a fixed delimiter.
 merge_env_layers() {
   awk -F= '
     {
@@ -164,16 +175,19 @@ merge_env_layers() {
       val[key] = $0
     }
     END {
-      n = asorti(val, sorted)
-      for (i = 1; i <= n; i++) print sorted[i] "=" val[sorted[i]]
+      for (k in val) print k "=" val[k]
     }
-  '
+  ' | LC_ALL=C sort
 }
 
 # ---- build the merged defaults layer --------------------------------------
 
 DEFAULTS_LINES="$( { parse_env_file "$DEFAULTS_FILE"; parse_env_file "$ENV_DEFAULTS_FILE"; } | merge_env_layers )"
 DEFAULTS_KEYS="$(printf '%s\n' "$DEFAULTS_LINES" | awk -F= 'NF>0{print $1}')"
+# `grep -c .` always prints a number (including 0 for empty input)
+# and exits 1 when zero matches; piping `|| true` keeps the printed
+# count and ignores the exit. (Earlier `|| echo 0` would emit "0\n0"
+# in the empty case — confusing, fixed.)
 DEFAULTS_COUNT="$(printf '%s\n' "$DEFAULTS_LINES" | grep -c . || true)"
 
 [ "$DEFAULTS_COUNT" -gt 0 ] \
@@ -194,7 +208,7 @@ COMPOSE_JSON="$(curl -fsS -H "x-api-key: $DOKPLOY_API_KEY" \
 CURRENT_ENV="$(printf '%s' "$COMPOSE_JSON" | jq -r '.env // ""')"
 CURRENT_NAME="$(printf '%s' "$COMPOSE_JSON" | jq -r '.name // .composeId')"
 log "Compose name: $CURRENT_NAME"
-log "Current env panel: $(printf '%s\n' "$CURRENT_ENV" | grep -c . || echo 0) keys"
+log "Current env panel: $(printf '%s\n' "$CURRENT_ENV" | grep -c . || true) keys"
 
 # ---- compute the merged env ------------------------------------------------
 
@@ -204,13 +218,19 @@ log "Current env panel: $(printf '%s\n' "$CURRENT_ENV" | grep -c . || echo 0) ke
 #   3. Preserve everything else verbatim (bws-managed secrets, etc.).
 
 TMP_CURRENT="$(mktemp)"
+TMP_BODY="$(mktemp)"
+TMP_TAIL="$(mktemp)"
 TMP_NEW="$(mktemp)"
-trap 'rm -f "$TMP_CURRENT" "$TMP_NEW"' EXIT
+trap 'rm -f "$TMP_CURRENT" "$TMP_BODY" "$TMP_TAIL" "$TMP_NEW"' EXIT
 
 printf '%s' "$CURRENT_ENV"  > "$TMP_CURRENT"
 printf '\n'               >> "$TMP_CURRENT"  # ensure trailing newline
 
-awk -v defaults="$DEFAULTS_LINES" '
+# POSIX awk only (no asorti) — body lines emit normally; defaults
+# that weren't already in the panel are emitted to $TMP_TAIL via
+# `print ... > file`, then sorted externally with `LC_ALL=C sort`
+# before being concatenated onto the body.
+awk -v defaults="$DEFAULTS_LINES" -v tail_file="$TMP_TAIL" '
   BEGIN {
     n = split(defaults, lines, "\n")
     for (i = 1; i <= n; i++) {
@@ -244,22 +264,22 @@ awk -v defaults="$DEFAULTS_LINES" '
     }
   }
   END {
-    # Append keys that were in defaults but not in the current panel.
-    n = asorti(def_val, sorted)
-    appended = 0
-    for (i = 1; i <= n; i++) {
-      k = sorted[i]
-      if (!def_seen[k]) {
-        if (!appended) {
-          print ""
-          print "# === added by sync-dokploy-env.sh — values from .env.defaults* ==="
-          appended = 1
-        }
-        print k "=" def_val[k]
-      }
+    # Stream unseen defaults to a side-channel file; sorted in shell.
+    for (k in def_val) {
+      if (!def_seen[k]) print k "=" def_val[k] > tail_file
     }
   }
-' "$TMP_CURRENT" > "$TMP_NEW"
+' "$TMP_CURRENT" > "$TMP_BODY"
+
+# Stitch body + (sorted, deduped) appended new-defaults section.
+cp "$TMP_BODY" "$TMP_NEW"
+if [ -s "$TMP_TAIL" ]; then
+  {
+    printf '\n'
+    printf '# === added by sync-dokploy-env.sh — values from .env.defaults* ===\n'
+    LC_ALL=C sort -u "$TMP_TAIL"
+  } >> "$TMP_NEW"
+fi
 
 # ---- compute diff ----------------------------------------------------------
 
@@ -306,14 +326,38 @@ NEW_ENV="$(<"$TMP_NEW")"
 PAYLOAD="$(jq -n --arg id "$COMPOSE_ID" --arg env "$NEW_ENV" \
   '{composeId: $id, env: $env}')"
 
-log "Pushing merged env to Dokploy ($(printf '%s\n' "$NEW_ENV" | grep -c . || echo 0) keys)…"
+log "Pushing merged env to Dokploy ($(printf '%s\n' "$NEW_ENV" | grep -c . || true) keys)…"
 
-RESP="$(curl -fsS -X POST \
-  -H "x-api-key: $DOKPLOY_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d "$PAYLOAD" \
-  "$DOKPLOY_URL/compose.update")" || die "Dokploy push failed:
-$RESP"
+# `curl -f` discards the response body on HTTP errors, which
+# leaves $RESP empty and makes `die` print no diagnostic. Capture
+# body + status code separately so the failure message includes
+# Dokploy's actual error text (typically `{"error":"..."}` JSON).
+post_dokploy() {
+  # $1 = endpoint path, $2 = JSON payload, $3 = label for errors
+  local endpoint="$1" body="$2" label="$3"
+  local body_file status
+  body_file="$(mktemp)"
+  status="$(curl -sS -o "$body_file" -w '%{http_code}' \
+    -X POST \
+    -H "x-api-key: $DOKPLOY_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$body" \
+    "$DOKPLOY_URL/$endpoint" || echo "000")"
+  if [ "$status" = "000" ]; then
+    local err; err="$(cat "$body_file")"; rm -f "$body_file"
+    die "$label failed (curl error / no HTTP response):
+$err"
+  fi
+  if [ "$status" -ge 400 ]; then
+    local err; err="$(cat "$body_file")"; rm -f "$body_file"
+    die "$label failed (HTTP $status):
+$err"
+  fi
+  cat "$body_file"
+  rm -f "$body_file"
+}
+
+RESP="$(post_dokploy "compose.update" "$PAYLOAD" "Dokploy push")"
 
 log "Pushed. Dokploy will pick up the new env on the next deploy."
 
@@ -321,12 +365,8 @@ log "Pushed. Dokploy will pick up the new env on the next deploy."
 
 if [ "$REDEPLOY" -eq 1 ]; then
   log "Triggering redeploy…"
-  RD_RESP="$(curl -fsS -X POST \
-    -H "x-api-key: $DOKPLOY_API_KEY" \
-    -H "Content-Type: application/json" \
-    -d "{\"composeId\":\"$COMPOSE_ID\"}" \
-    "$DOKPLOY_URL/compose.redeploy")" || die "Redeploy failed:
-$RD_RESP"
+  RD_RESP="$(post_dokploy "compose.redeploy" \
+    "{\"composeId\":\"$COMPOSE_ID\"}" "Redeploy")"
   log "Redeploy queued. Watch Dokploy compose logs for completion."
 fi
 
