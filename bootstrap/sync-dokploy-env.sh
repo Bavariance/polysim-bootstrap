@@ -31,9 +31,16 @@
 #   sync-dokploy-env.sh --env staging-api --redeploy    # also trigger redeploy
 #   sync-dokploy-env.sh --env prod --compose-id <other-id>  # override mapping
 #
-# Auth resolution:
-#   - $DOKPLOY_API_KEY env var
-#   - ~/.config/polysim/dokploy-api-key (chmod 600)
+# Auth resolution (highest precedence first):
+#   1. $DOKPLOY_API_KEY env var (manual override always wins)
+#   2. bws (Bitwarden Secrets Manager) — secret key DOKPLOY_API_KEY in
+#      the configured project. This matches sync-secrets.sh, so a host
+#      that already has bws set up needs no extra config. Override the
+#      secret name with --bws-key=NAME.
+#   3. ~/.config/polysim/dokploy-api-key (legacy plaintext fallback)
+#
+# Skip the bws lookup with --no-bws (useful when you want to be sure
+# the key file or env var is what's used).
 #
 # Server URL:
 #   - $DOKPLOY_URL env var
@@ -54,6 +61,8 @@ ENV_NAME=""
 DRY_RUN=0
 REDEPLOY=0
 COMPOSE_ID_OVERRIDE=""
+BWS_KEY_NAME="DOKPLOY_API_KEY"
+NO_BWS=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -63,9 +72,13 @@ while [ $# -gt 0 ]; do
     --compose-id)    [ $# -ge 2 ] || die "--compose-id requires a value"
                      COMPOSE_ID_OVERRIDE="$2"; shift 2 ;;
     --compose-id=*)  COMPOSE_ID_OVERRIDE="${1#*=}"; shift ;;
+    --bws-key)       [ $# -ge 2 ] || die "--bws-key requires a value"
+                     BWS_KEY_NAME="$2"; shift 2 ;;
+    --bws-key=*)     BWS_KEY_NAME="${1#*=}"; shift ;;
+    --no-bws)        NO_BWS=1; shift ;;
     --dry-run|-n)    DRY_RUN=1; shift ;;
     --redeploy)      REDEPLOY=1; shift ;;
-    -h|--help)       sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)       sed -n '2,57p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)               die "Unknown argument: $1 (use --help)" ;;
   esac
 done
@@ -99,14 +112,76 @@ fi
 CFG_DIR="$HOME/.config/polysim"
 KEY_FILE="$CFG_DIR/dokploy-api-key"
 URL_FILE="$CFG_DIR/dokploy-url"
+BWS_TOKEN_FILE="$CFG_DIR/bws-token"
+BWS_PROJECT_FILE="$CFG_DIR/bws-project-id"
+BWS_SERVER_URL_FILE="$CFG_DIR/bws-server-url"
 
+# Resolution order: env var → bws → legacy file.
+# Step 1: env var wins immediately.
+DOKPLOY_API_KEY_SOURCE=""
+if [ -n "${DOKPLOY_API_KEY:-}" ]; then
+  DOKPLOY_API_KEY_SOURCE="env var"
+fi
+
+# Step 2: bws (only if env var didn't resolve and --no-bws not passed).
+# Mirrors the sync-secrets.sh setup: $BWS_ACCESS_TOKEN env var or
+# ~/.config/polysim/bws-token, $BWS_PROJECT_ID env or bws-project-id.
+if [ -z "${DOKPLOY_API_KEY:-}" ] && [ "$NO_BWS" -eq 0 ]; then
+  if command -v bws >/dev/null 2>&1; then
+    if [ -z "${BWS_ACCESS_TOKEN:-}" ] && [ -r "$BWS_TOKEN_FILE" ]; then
+      BWS_ACCESS_TOKEN="$(cat "$BWS_TOKEN_FILE")"
+    fi
+    if [ -z "${BWS_PROJECT_ID:-}" ] && [ -r "$BWS_PROJECT_FILE" ]; then
+      BWS_PROJECT_ID="$(cat "$BWS_PROJECT_FILE")"
+    fi
+    if [ -z "${BWS_SERVER_URL:-}" ] && [ -r "$BWS_SERVER_URL_FILE" ]; then
+      BWS_SERVER_URL="$(cat "$BWS_SERVER_URL_FILE")"
+    fi
+    BWS_ACCESS_TOKEN="$(printf '%s' "${BWS_ACCESS_TOKEN:-}" | tr -d '[:space:]')"
+    BWS_PROJECT_ID="$(printf '%s' "${BWS_PROJECT_ID:-}" | tr -d '[:space:]')"
+    if [ -n "$BWS_ACCESS_TOKEN" ] && [ -n "$BWS_PROJECT_ID" ]; then
+      export BWS_ACCESS_TOKEN BWS_PROJECT_ID
+      [ -n "${BWS_SERVER_URL:-}" ] && export BWS_SERVER_URL
+      log "Looking up '$BWS_KEY_NAME' in bws (project $BWS_PROJECT_ID)…"
+      _bws_secrets="$(bws secret list -o json "$BWS_PROJECT_ID" 2>&1)" || {
+        warn "bws fetch failed; falling back to key file. Output:"
+        printf '%s\n' "$_bws_secrets" >&2
+        _bws_secrets=""
+      }
+      if [ -n "$_bws_secrets" ]; then
+        _bws_value="$(printf '%s' "$_bws_secrets" \
+          | jq -r --arg k "$BWS_KEY_NAME" \
+              '[.[] | select(.key == $k) | .value][0] // empty' 2>/dev/null)"
+        if [ -n "$_bws_value" ]; then
+          DOKPLOY_API_KEY="$_bws_value"
+          DOKPLOY_API_KEY_SOURCE="bws ($BWS_KEY_NAME)"
+        else
+          warn "bws has no secret named '$BWS_KEY_NAME' — falling back to key file."
+        fi
+      fi
+    fi
+  fi
+fi
+
+# Step 3: legacy plaintext file (only if still unresolved).
 if [ -z "${DOKPLOY_API_KEY:-}" ] && [ -r "$KEY_FILE" ]; then
   DOKPLOY_API_KEY="$(<"$KEY_FILE")"
+  DOKPLOY_API_KEY_SOURCE="$KEY_FILE"
 fi
+
 DOKPLOY_API_KEY="$(printf '%s' "${DOKPLOY_API_KEY:-}" | tr -d '[:space:]')"
-[ -n "$DOKPLOY_API_KEY" ] || die "DOKPLOY_API_KEY not set, and $KEY_FILE not found.
-Persist your key:
-  mkdir -p $CFG_DIR && printf '%s\n' '<token>' > $KEY_FILE && chmod 600 $KEY_FILE"
+[ -n "$DOKPLOY_API_KEY" ] || die "DOKPLOY_API_KEY could not be resolved.
+Tried (in order):
+  1. \$DOKPLOY_API_KEY env var
+  2. bws (secret '$BWS_KEY_NAME' in project \$BWS_PROJECT_ID)
+  3. $KEY_FILE
+Either:
+  - Add the secret to bws as $BWS_KEY_NAME (recommended), OR
+  - export DOKPLOY_API_KEY=<token>, OR
+  - Persist a key file:
+      mkdir -p $CFG_DIR && printf '%s\n' '<token>' > $KEY_FILE && chmod 600 $KEY_FILE"
+
+log "Auth source: $DOKPLOY_API_KEY_SOURCE"
 
 if [ -z "${DOKPLOY_URL:-}" ] && [ -r "$URL_FILE" ]; then
   DOKPLOY_URL="$(<"$URL_FILE")"
