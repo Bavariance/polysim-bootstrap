@@ -30,6 +30,19 @@
 #   sync-dokploy-env.sh --env staging-api --dry-run     # show diff, don't push
 #   sync-dokploy-env.sh --env staging-api --redeploy    # also trigger redeploy
 #   sync-dokploy-env.sh --env prod --compose-id <other-id>  # override mapping
+#   sync-dokploy-env.sh --env staging --allow-empty     # opt back in to pushing empties
+#
+# Empty-value handling (default: SKIP):
+#   .env.defaults declares some keys with empty RHS as placeholders for
+#   bws-managed secrets (e.g. `LOKI_QUERY_USER=`, `LOKI_QUERY_PASS=`). The
+#   real value lives in the Dokploy stored env (or bws). Pushing the empty
+#   placeholder would BLAT the real cred — so by default this script DROPS
+#   empty-value keys from the layered defaults BEFORE building the diff.
+#   The dry-run prints which keys were skipped.
+#
+#   --skip-empty   (default ON) drop empty-value keys from defaults
+#   --allow-empty  explicit opt-out: include empty-value keys in the push
+#                  (use only when intentionally clearing a Dokploy value)
 #
 # Auth resolution (highest precedence first):
 #   1. $DOKPLOY_API_KEY env var (manual override always wins)
@@ -63,6 +76,7 @@ REDEPLOY=0
 COMPOSE_ID_OVERRIDE=""
 BWS_KEY_NAME="DOKPLOY_API_KEY"
 NO_BWS=0
+SKIP_EMPTY=1   # default ON — see help block, prevents BLAT'ing bws-managed secrets
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -76,9 +90,11 @@ while [ $# -gt 0 ]; do
                      BWS_KEY_NAME="$2"; shift 2 ;;
     --bws-key=*)     BWS_KEY_NAME="${1#*=}"; shift ;;
     --no-bws)        NO_BWS=1; shift ;;
+    --skip-empty)    SKIP_EMPTY=1; shift ;;
+    --allow-empty)   SKIP_EMPTY=0; shift ;;
     --dry-run|-n)    DRY_RUN=1; shift ;;
     --redeploy)      REDEPLOY=1; shift ;;
-    -h|--help)       sed -n '2,57p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)       sed -n '2,63p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)               die "Unknown argument: $1 (use --help)" ;;
   esac
 done
@@ -269,6 +285,36 @@ DEFAULTS_COUNT="$(printf '%s\n' "$DEFAULTS_LINES" | grep -c . || true)"
   || die "0 keys parsed from defaults files — refusing to push an empty env."
 
 log "Loaded $DEFAULTS_COUNT keys from defaults layer ($DEFAULTS_FILE + $ENV_DEFAULTS_FILE)"
+
+# ---- filter empty-value keys (default ON) ---------------------------------
+#
+# .env.defaults declares some keys with empty RHS as bws-managed-secret
+# placeholders (e.g. `LOKI_QUERY_USER=`). The real value lives in the
+# Dokploy stored env. Pushing the empty placeholder would BLAT the real
+# cred — so by default we DROP empty-value keys before building the diff.
+# Override with --allow-empty when intentionally clearing a value.
+if [ "$SKIP_EMPTY" -eq 1 ]; then
+  EMPTY_KEYS="$(printf '%s\n' "$DEFAULTS_LINES" \
+    | awk -F= 'NF>=2 && $2=="" { print $1 }')"
+  EMPTY_COUNT="$(printf '%s\n' "$EMPTY_KEYS" | grep -c . || true)"
+  if [ "$EMPTY_COUNT" -gt 0 ]; then
+    log "Skipping $EMPTY_COUNT empty bws-placeholder keys (use --allow-empty to push them):"
+    while IFS= read -r _k; do
+      [ -n "$_k" ] || continue
+      printf '  - %s\n' "$_k" >&2
+    done <<< "$EMPTY_KEYS"
+    DEFAULTS_LINES="$(printf '%s\n' "$DEFAULTS_LINES" \
+      | awk -F= '!(NF>=2 && $2=="")')"
+    DEFAULTS_KEYS="$(printf '%s\n' "$DEFAULTS_LINES" | awk -F= 'NF>0{print $1}')"
+    DEFAULTS_COUNT="$(printf '%s\n' "$DEFAULTS_LINES" | grep -c . || true)"
+    [ "$DEFAULTS_COUNT" -gt 0 ] \
+      || die "0 keys remain after --skip-empty filter — refusing to push an empty env. Use --allow-empty if this was intentional."
+    log "After --skip-empty filter: $DEFAULTS_COUNT keys remaining."
+  fi
+else
+  log "--allow-empty set: empty-value keys WILL be pushed (may BLAT bws-managed secrets)."
+fi
+
 log "Target compose: $COMPOSE_ID (env=$ENV_NAME)"
 log "Dokploy URL:    $DOKPLOY_URL"
 

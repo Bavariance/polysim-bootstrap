@@ -363,6 +363,38 @@ chmod 600 ~/.config/polysim/dokploy-url
 
 Override with `--compose-id <id>` for new composes not in the table.
 
+### Empty-value placeholders (`--skip-empty` is ON by default)
+
+`.env.defaults` declares a few keys as **empty placeholders** for
+bws-managed secrets — e.g. `LOKI_QUERY_USER=` and `LOKI_QUERY_PASS=`.
+The real values are only present in the Dokploy stored env (or in bws,
+for local dev via `sync-secrets.sh`).
+
+Without protection, `sync-dokploy-env.sh` would happily push the empty
+RHS to the Dokploy panel and **wipe the real credentials**. So:
+
+- `--skip-empty` is **ON by default** — keys with empty values are
+  dropped from the layered defaults before the diff is built. The
+  dry-run prints which keys were skipped:
+
+  ```
+  [dok-sync] Skipping 2 empty bws-placeholder keys (use --allow-empty to push them):
+    - LOKI_QUERY_PASS
+    - LOKI_QUERY_USER
+  ```
+
+- `--allow-empty` is the explicit opt-out for the rare case where you
+  really do want to clear a value in the Dokploy panel by pushing an
+  empty RHS. Use only when intentionally clearing a value.
+
+This was caught (and fixed) on 2026-05-10 by a `--dry-run` that showed:
+
+```
+~ LOKI_QUERY_PASS: L1Zn37fz6mi8rfKrs3VXuVz5xyH3kLUe →
+```
+
+(empty RHS = wrapper would have wiped the real Loki ingest credential).
+
 ### What lives where
 
 | Layer | Source of truth | Consumed by |
