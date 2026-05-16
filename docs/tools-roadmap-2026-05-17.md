@@ -1045,13 +1045,10 @@ Each tier has a GitHub issue that links back to the relevant section of this
 document. PRs implementing individual tools should reference both this doc
 and the parent tier issue.
 
-- **Tier 1 — incident triage:** [tier-1 issue]
-- **Tier 2 — frequent ops:** [tier-2 issue]
-- **Tier 3 — observability + DR:** [tier-3 issue]
-- **Tier 4 — workflow polish:** [tier-4 issue]
-
-(URLs filled in after the issues are created; see the PR description for the
-authoritative links.)
+- **Tier 1 — incident triage:** https://github.com/Bavariance/polysim-bootstrap/issues/6
+- **Tier 2 — frequent ops:** https://github.com/Bavariance/polysim-bootstrap/issues/7
+- **Tier 3 — observability + DR:** https://github.com/Bavariance/polysim-bootstrap/issues/8
+- **Tier 4 — workflow polish:** https://github.com/Bavariance/polysim-bootstrap/issues/9
 
 ---
 
