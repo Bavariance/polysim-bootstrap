@@ -120,7 +120,13 @@ while [ $# -gt 0 ]; do
     --no-strip-quotes) STRIP_QUOTES=0; shift ;;
     --dry-run|-n)     DRY_RUN=1; shift ;;
     --deploy)         DEPLOY=1; shift ;;
-    -h|--help)        sed -n '2,99p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # --help renders only the leading comment header (lines 2–86 below
+    # the shebang) — line 87 is the first executable line (`set -euo
+    # pipefail`). Sibling scripts use the same pattern (e.g.
+    # sync-dokploy-env.sh:97 → `sed -n '2,63p'`). When extending the
+    # header in the future, bump the upper bound to stay in sync.
+    # Copilot review on PR #4: prior `2,99p` leaked code into --help.
+    -h|--help)        sed -n '2,86p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)                die "Unknown argument: $1 (use --help)" ;;
   esac
 done
@@ -290,7 +296,7 @@ SECRET_VALUE="$(printf '%s' "$BWS_SECRETS_JSON" \
 if [ -z "$SECRET_VALUE" ]; then
   die "bws has no secret named '$KEY_NAME' in project $BWS_PROJECT_ID.
 Either:
-  - Verify the key name with: bws secret list -o json | jq -r '.[].key' | grep -i ${KEY_NAME}
+  - Verify the key name with: bws secret list -o json '$BWS_PROJECT_ID' | jq -r '.[].key' | grep -iF -- '$KEY_NAME'
   - Add it via the bws CLI or the sm.bitwarden.com UI."
 fi
 
@@ -366,8 +372,18 @@ fi
 # value (keeping only the first occurrence; any duplicates are dropped).
 # If no existing line was found, the END block appends one. Other
 # lines (comments, blanks, unrelated KEY=VALUE) are preserved verbatim.
-awk -v key="$KEY_NAME" -v newval="$SECRET_VALUE" '
-  BEGIN { found = 0 }
+#
+# CRITICAL — Codex P1 review on PR #4: `awk -v newval="$SECRET_VALUE"`
+# interprets backslash escapes in the value (\n, \t, \r, \\, etc.). A
+# secret like `whsec_a\nb` would be rewritten to `whsec_a<newline>b`
+# before being written to the env blob — silently corrupting the secret
+# AND bypassing the earlier newline-rejection guard. The fix: pass the
+# secret via the environment (ENVIRON[]), which awk treats as a literal
+# byte stream with no escape interpretation. The `key` var is safe
+# because env-var-name syntax forbids backslashes.
+NEW_VAL_FOR_AWK="$SECRET_VALUE" \
+awk -v key="$KEY_NAME" '
+  BEGIN { found = 0; newval = ENVIRON["NEW_VAL_FOR_AWK"] }
   {
     line = $0
     eq = index(line, "=")
@@ -463,9 +479,17 @@ if [ "$DEPLOY" -eq 1 ]; then
   # we just rotated a secret. compose.redeploy reuses the cached .env.
   # Verified 2026-05-14 (PR #1199 daemon poller flip).
   log "Triggering compose.deploy (re-renders on-host .env from stored env)…"
-  DEPLOY_RESP="$(post_dokploy "compose.deploy" \
-    "{\"composeId\":\"$COMPOSE_ID\",\"title\":\"push-bws-key-to-dokploy.sh: $KEY_NAME\"}" \
-    "Deploy")"
+  # jq -n --arg ensures JSON-correct escaping of the compose-id + title
+  # (Copilot review on PR #4: prior string-interpolation would emit
+  # invalid JSON if either field contained a `"` or `\` byte). The
+  # compose-id is typically alphanumeric+dashes (Dokploy convention),
+  # but the title contains user-supplied KEY_NAME which could include
+  # any env-var-syntax character — safer to escape via jq.
+  DEPLOY_PAYLOAD="$(jq -n \
+    --arg id "$COMPOSE_ID" \
+    --arg title "push-bws-key-to-dokploy.sh: $KEY_NAME" \
+    '{composeId: $id, title: $title}')"
+  DEPLOY_RESP="$(post_dokploy "compose.deploy" "$DEPLOY_PAYLOAD" "Deploy")"
   log "Deploy queued. Polling deployments[0].status…"
 
   # Poll compose.one.deployments[0].status: running → done.
