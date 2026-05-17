@@ -31,13 +31,12 @@ $HOME/
     bootstrap/install.sh
     bootstrap/link-configs.sh
     bootstrap/sync-secrets.sh
-    bootstrap/sync-dokploy-env.sh     ← pushes .env.defaults* to Dokploy panels
     configs/{bash,zsh,tmux,direnv,polysim}/
   .config/polysim/                    ← chmod 700
     bws-token                         ← chmod 600, gitignored (machine account token)
     bws-project-id                    ← chmod 600, gitignored (UUID of the bws project)
     bws-server-url                    ← chmod 600, gitignored (only if on Bitwarden EU)
-    dokploy-api-key                   ← chmod 600, gitignored (used by sync-dokploy-env.sh)
+    dokploy-api-key                   ← chmod 600, gitignored (consumed by polysim-ops `polysim-admin env-sync`)
     dokploy-url                       ← chmod 600, gitignored (defaults to hosting.wladefant.de/api)
     shell-init.sh                     ← symlink → bootstrap/configs/polysim/shell-init.sh
   .ssh/
@@ -272,142 +271,56 @@ All scripts are **idempotent**:
 - `install.sh`             — re-checks each tool, installs only what's missing
 - `link-configs.sh`        — leaves correct symlinks alone, backs up real files to `*.bak-<timestamp>`
 - `sync-secrets.sh`        — re-pulls latest secrets, atomically replaces `<polysim-repo>/.env`
-- `sync-dokploy-env.sh`    — pushes `.env.defaults*` from the polysim repo to the matching Dokploy compose's environment-variables panel
 
 Run `sync-secrets.sh` whenever a secret rotates in Bitwarden Secrets Manager.
 You do **not** need to re-run `direnv allow .` — direnv stays trusting the
 same `.envrc` until its content changes (then it asks you to re-allow once).
 
+> **`sync-dokploy-env.sh` + `push-bws-key-to-dokploy.sh` moved.** Both scripts
+> now live in the private operator repo (`Bavariance/polysim-ops`) as
+> `polysim-admin env-sync` and `polysim-admin bws-push`. See that repo's
+> README for the new invocations. The `bws-token` / `dokploy-api-key`
+> resolution chain is unchanged — operators with a bws-bootstrapped host
+> get the same zero-extra-config flow.
+
 ---
 
-## Pushing `.env.defaults*` to Dokploy compose panels
+## Pushing `.env.defaults*` to Dokploy compose panels — MOVED
 
-`sync-secrets.sh` writes secrets to the **local** `.env` for `docker compose
-up` on your dev box. That's not what runs in production — Dokploy reads its
-own per-compose env-variables panel at deploy time.
-
-`sync-dokploy-env.sh` closes that loop. It reads the same layered defaults
-files (`.env.defaults` + `.env.defaults.<env>`), then **merges** the keys
-into the corresponding Dokploy compose panel — leaving every key not in the
-defaults (typically bws-managed secrets) untouched.
-
-### One-time setup
-
-The script resolves the Dokploy API key in this order — first hit wins:
-
-1. **`$DOKPLOY_API_KEY` env var** (manual override).
-2. **bws** — secret named `DOKPLOY_API_KEY` in your configured project.
-   This is the recommended path: if your host is already running
-   `sync-secrets.sh` (so `~/.config/polysim/bws-token` and
-   `bws-project-id` exist), there is **no extra setup**. Override the
-   secret name with `--bws-key=<NAME>`, or skip bws entirely with
-   `--no-bws`.
-3. **`~/.config/polysim/dokploy-api-key`** — legacy plaintext fallback.
-
-So in practice, on a host that's already bws-bootstrapped:
+Both `sync-dokploy-env.sh` (bulk-sync defaults to a compose panel) and
+`push-bws-key-to-dokploy.sh` (push a single rotated bws secret) now live
+in the private operator repo **[`Bavariance/polysim-ops`](https://github.com/Bavariance/polysim-ops)**.
+The bash scripts have been removed from this repo (`polysim-bootstrap`).
 
 ```bash
-# Nothing to do. The script will pull DOKPLOY_API_KEY from bws on first run.
-~/bootstrap/bootstrap/sync-dokploy-env.sh --env staging-api --dry-run
+# install polysim-ops once
+git clone git@github.com:Bavariance/polysim-ops.git
+cd polysim-ops && pip install -e .
+
+# bulk env-sync (replaces sync-dokploy-env.sh)
+polysim-admin env-sync --env staging --dry-run
+polysim-admin env-sync --env staging
+polysim-admin env-sync --env prod --redeploy
+
+# single-secret push (replaces push-bws-key-to-dokploy.sh)
+polysim-admin bws-push --env prod --key STRIPE_SUBSCRIPTION_WEBHOOK_SECRET --deploy
 ```
 
-If bws isn't an option (e.g. on a CI runner without machine-account
-access), fall back to either the env var:
+CLI flags, defaults, exit codes, and Dokploy auth resolution chain
+(`$DOKPLOY_API_KEY` → bws `DOKPLOY_API_KEY` → `~/.config/polysim/dokploy-api-key`)
+all carry over 1:1 — operators with a bws-bootstrapped host get the same
+zero-extra-config flow. See the polysim-ops README for the full operator
+recipes including empty-value placeholder handling (`--skip-empty` ON by
+default to protect bws-managed secrets), the compose ID mapping, and the
+`sql-read` read-only Supabase wrapper.
 
-```bash
-DOKPLOY_API_KEY=<token> ~/bootstrap/bootstrap/sync-dokploy-env.sh --env staging-api
-```
-
-…or the legacy file:
-
-```bash
-mkdir -p ~/.config/polysim
-printf '%s\n' '<dokploy-api-key>' > ~/.config/polysim/dokploy-api-key
-chmod 600 ~/.config/polysim/dokploy-api-key
-```
-
-Override the Dokploy server URL only if you're not on the
-default `https://hosting.wladefant.de/api`:
-
-```bash
-printf '%s\n' '<your-dokploy-url>' > ~/.config/polysim/dokploy-url
-chmod 600 ~/.config/polysim/dokploy-url
-```
-
-### Daily flow
-
-```bash
-# 1. Edit .env.defaults.<env> in the polysimulator repo, commit + push.
-# 2. After the staging branch deploys, sync the panel for the relevant compose:
-~/bootstrap/bootstrap/sync-dokploy-env.sh --env staging-api --dry-run
-# Inspect the diff:
-#   + NEW_KEY=value
-#   ~ EXISTING_KEY: old → new
-#   = UNCHANGED_KEY (printed only as a count)
-
-# 3. Apply:
-~/bootstrap/bootstrap/sync-dokploy-env.sh --env staging-api
-
-# 4. Optionally redeploy the compose so the new env takes effect immediately:
-~/bootstrap/bootstrap/sync-dokploy-env.sh --env staging-api --redeploy
-```
-
-### Compose mapping baked into the script
-
-| `--env` | composeId | name |
-|---|---|---|
-| `prod` | `qCKlu4fStE0xLfZRCKUdw` | Production |
-| `staging` | `nG8qoVvsNNaMyycQ-OVZc` | Staging (Frankfurt) |
-| `staging-api` | `D7D0CWyem5CjJi2bTegfZ` | Staging-API (US-East) |
-| `staging3` | `7zxtKuQLxU9Po8GmtMbJh` | Staging3 (US-East) |
-
-Override with `--compose-id <id>` for new composes not in the table.
-
-### Empty-value placeholders (`--skip-empty` is ON by default)
-
-`.env.defaults` declares a few keys as **empty placeholders** for
-bws-managed secrets — e.g. `LOKI_QUERY_USER=` and `LOKI_QUERY_PASS=`.
-The real values are only present in the Dokploy stored env (or in bws,
-for local dev via `sync-secrets.sh`).
-
-Without protection, `sync-dokploy-env.sh` would happily push the empty
-RHS to the Dokploy panel and **wipe the real credentials**. So:
-
-- `--skip-empty` is **ON by default** — keys with empty values are
-  dropped from the layered defaults before the diff is built. The
-  dry-run prints which keys were skipped:
-
-  ```
-  [dok-sync] Skipping 2 empty bws-placeholder keys (use --allow-empty to push them):
-    - LOKI_QUERY_PASS
-    - LOKI_QUERY_USER
-  ```
-
-- `--allow-empty` is the explicit opt-out for the rare case where you
-  really do want to clear a value in the Dokploy panel by pushing an
-  empty RHS. Use only when intentionally clearing a value.
-
-This was caught (and fixed) on 2026-05-10 by a `--dry-run` that showed:
-
-```
-~ LOKI_QUERY_PASS: L1Zn37fz6mi8rfKrs3VXuVz5xyH3kLUe →
-```
-
-(empty RHS = wrapper would have wiped the real Loki ingest credential).
-
-### What lives where
+### What lives where (unchanged after the migration)
 
 | Layer | Source of truth | Consumed by |
 |---|---|---|
-| Public defaults (per-env tunables, non-secret) | `polysimulator/.env.defaults*` | `sync-dokploy-env.sh` → Dokploy panel; `sync-secrets.sh` → local `.env` |
-| Secrets (API keys, JWT secret, Stripe keys, etc.) | Bitwarden Secrets Manager | `sync-secrets.sh` → local `.env`; **manually** entered in Dokploy panel — `sync-dokploy-env.sh` does NOT push secrets |
+| Public defaults (per-env tunables, non-secret) | `polysimulator/.env.defaults*` | polysim-ops `polysim-admin env-sync` → Dokploy panel; `sync-secrets.sh` → local `.env` |
+| Secrets (API keys, JWT secret, Stripe keys, etc.) | Bitwarden Secrets Manager | `sync-secrets.sh` → local `.env`; polysim-ops `polysim-admin bws-push` → Dokploy panel one-at-a-time |
 | Inline compose fallbacks | `docker-compose.*.yml` `${VAR:-default}` | Used only when the panel doesn't set the var; safety net for misconfigured panels |
-
-`sync-dokploy-env.sh` deliberately leaves bws-managed secrets in the panel
-untouched — even if the Dokploy panel has them hand-entered, the merge
-preserves them. The only divergence the script removes is between
-`.env.defaults*` and the Dokploy panel, and only for the keys
-explicitly listed in the defaults files.
 
 ---
 
