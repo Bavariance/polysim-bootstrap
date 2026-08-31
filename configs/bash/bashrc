@@ -104,5 +104,36 @@ zpoly_reset() {
   zellij --new-session-with-layout polysimulator -s polysimulator
 }
 
+# ---- long-running agent sessions --------------------------------------------
+# One dedicated, detachable zellij session per project, so a Claude agent keeps
+# working while the laptop is shut or the network drops. Generic on purpose:
+# moving a session to another machine should be one line here, not a new layout.
+#
+#   zagent <name> [dir]   attach, or create in ~/projects/<name> using
+#                         the agent-session layout
+#   zagent_reset <name>   kill and recreate from scratch (loses the agent's
+#                         context; its MEMORY store survives, so this is safe)
+#   zbiz                  polysimulator-business
+#
+# After creating a session, run /rc inside it once to enable Remote Control if
+# you want it reachable from the phone - that is per-session and not scriptable.
+zagent() {
+  local name="${1:?usage: zagent <session-name> [dir]}"
+  local dir="${2:-$HOME/projects/$name}"
+  if [ ! -d "$dir" ]; then
+    printf 'zagent: no such directory: %s\n' "$dir" >&2
+    return 1
+  fi
+  cd "$dir" || return 1
+  zellij attach "$name" -c options --default-layout agent-session
+}
+zagent_reset() {
+  local name="${1:?usage: zagent_reset <session-name> [dir]}"
+  zellij kill-session "$name" 2>/dev/null || true
+  zellij delete-session "$name" 2>/dev/null || true
+  zagent "$@"
+}
+zbiz() { zagent polysimulator-business "$@"; }
+
 # ---- local overrides (gitignored) -------------------------------------------
 [ -r "$HOME/.bashrc.local" ] && . "$HOME/.bashrc.local"

@@ -1,0 +1,68 @@
+// agent-session.kdl — generic zellij layout for a long-running Claude agent session.
+//
+// One session per PROJECT, dedicated and detachable, so an agent keeps working
+// while the laptop is closed or the network drops. Created by the `zagent`
+// function (configs/{bash,zsh}/*), which cd's into the project first, so every
+// pane inherits that cwd and this file needs no hardcoded paths.
+//
+//   zagent polysimulator-business      # attach, or create if absent
+//   zbiz                               # same thing, shorter
+//
+// Deliberately smaller than polysimulator.kdl: an agent session wants an agent
+// and somewhere to look over its shoulder, not a five-tab dev cockpit.
+//
+// The agent pane runs ${AGENT_CMD}, defaulting to bypass-permissions because
+// that is how these sessions are actually run. Override per machine:
+//   export AGENT_CMD="claude"
+//
+//
+// NOTE (2026-08-31): create these sessions from a REAL terminal, never from a
+// detached 80x24 host. Zellij sizes a session to its smallest attached client,
+// so a session created inside a small tmux pane renders Claude's TUI unusably
+// cramped and the pane can die outright. `zagent` from your own terminal is the
+// supported path; it creates the session at your actual size.
+//
+// start_suspended=false on the agent pane: the point is that it comes up on its
+// own after a reboot or a `zagent` from a phone, without someone pressing enter.
+
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        children
+        pane size=2 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+
+    tab name="agent" focus=true split_direction="vertical" {
+        pane name="claude" command="bash" focus=true size="72%" start_suspended=false {
+            // -ic, NOT -lc. `claude` is installed through fnm, which initialises in
+            // .bashrc (interactive) and NOT in the login-profile chain, so `bash -lc`
+            // gives "claude: command not found" unless the zellij SERVER happened to
+            // inherit a PATH that already had it. That inheritance is why zpoly works
+            // and why this broke the moment the session was created from elsewhere.
+            // An interactive shell sources .bashrc and resolves it every time.
+            args "-ic" "${AGENT_CMD:-claude --dangerously-skip-permissions}"
+        }
+        pane name="ops" split_direction="horizontal" size="28%" {
+            pane name="shell"
+            pane name="git" command="bash" start_suspended=true {
+                args "-lc" "git status -sb; exec bash -l"
+            }
+        }
+    }
+
+    tab name="watch" split_direction="horizontal" {
+        pane name="scratch" focus=true size="60%"
+        pane split_direction="vertical" size="40%" {
+            pane name="memory" command="bash" start_suspended=true {
+                args "-lc" "python3 ~/.claude/memory/bin/memory_sync.py status; exec bash -l"
+            }
+            pane name="system" command="bash" start_suspended=true {
+                args "-lc" "free -h; uptime; exec bash -l"
+            }
+        }
+    }
+}
