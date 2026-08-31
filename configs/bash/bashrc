@@ -134,6 +134,7 @@ zagent_reset() {
   zagent "$@"
 }
 zbiz() { zagent polysimulator-business "$@"; }
+zbiz_reset() { zagent_reset polysimulator-business "$@"; }
 
 # ---- local overrides (gitignored) -------------------------------------------
 [ -r "$HOME/.bashrc.local" ] && . "$HOME/.bashrc.local"
