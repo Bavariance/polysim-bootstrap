@@ -44,7 +44,9 @@ layout {
             // inherit a PATH that already had it. That inheritance is why zpoly works
             // and why this broke the moment the session was created from elsewhere.
             // An interactive shell sources .bashrc and resolves it every time.
-            args "-ic" "${AGENT_CMD:-claude --dangerously-skip-permissions}"
+            // Falls back to an interactive shell if the agent exits, instead of
+            // leaving a dead pane you cannot type into.
+            args "-ic" "${AGENT_CMD:-claude --dangerously-skip-permissions}; exec bash -i"
         }
         pane name="ops" split_direction="horizontal" size="28%" {
             pane name="shell"

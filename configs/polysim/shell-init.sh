@@ -55,3 +55,44 @@ if command -v keychain >/dev/null 2>&1 && [ -d "$HOME/.ssh" ]; then
   fi
   unset _polysim_keys _pub _priv
 fi
+
+# ---- MCP server secrets, sourced from Bitwarden Secrets Manager -------------
+# .mcp.json references these by name (e.g. "${GRAFANA_SERVICE_ACCOUNT_TOKEN}")
+# and never stores a value; MCP servers inherit this shell's environment. If a
+# variable is unset the literal "${NAME}" is sent as the credential, which the
+# API rejects as 401 -- that is exactly how the Grafana MCP silently broke.
+#
+# Deliberately: ONE `bws secret list` call (not one `get` per key), values kept
+# in the process environment only, and NOTHING written to disk. bws itself is
+# the only persistent store. Skipped for non-interactive shells so scripts and
+# rsync/scp sessions pay no startup cost, and failure is silent so a network
+# blip or an expired BWS token can never make a shell unusable.
+case "$-" in
+  *i*)
+    if [ -n "${BWS_ACCESS_TOKEN:-}" ] && command -v bws >/dev/null 2>&1 \
+       && [ -z "${GRAFANA_SERVICE_ACCOUNT_TOKEN:-}" ]; then
+      _polysim_mcp_env="$(bws secret list --color no 2>/dev/null | python3 -c '
+import json, sys
+WANT = ("GRAFANA_SERVICE_ACCOUNT_TOKEN", "SUPABASE_ACCESS_TOKEN", "DOKPLOY_API_KEY")
+try:
+    secrets = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+# Last occurrence wins: bws can hold more than one entry per key name (there
+# are currently two GRAFANA_SERVICE_ACCOUNT_TOKEN rows) and the newer row is
+# the live one. Deterministic beats arbitrary.
+found = {}
+for s in secrets:
+    k = s.get("key")
+    if k in WANT and s.get("value"):
+        found[k] = s["value"]
+for k in WANT:
+    v = found.get(k)
+    if v and "\n" not in v and "'"'"'" not in v:
+        print("export %s=%s" % (k, "'"'"'" + v + "'"'"'"))
+' 2>/dev/null)"
+      [ -n "$_polysim_mcp_env" ] && eval "$_polysim_mcp_env"
+      unset _polysim_mcp_env
+    fi
+    ;;
+esac
