@@ -1,0 +1,24 @@
+{
+  // Terminal clipboard on a REMOTE host (VS Code Remote-SSH -> globus).
+  //
+  // Symptom this fixes: Ctrl+V / Ctrl+Shift+V do nothing in the zellij pane, and
+  // Ctrl+Shift+V reaches Claude Code as an image-paste prompt. That happens when
+  // VS Code FORWARDS the keystroke to the shell instead of handling it as paste,
+  // so the app inside the terminal sees the raw key and VS Code never pastes.
+  //
+  // These are MACHINE settings: they apply to every remote workspace on this host,
+  // not just one repo. Keybindings themselves are client-side and cannot be set
+  // from here - see docs/vscode-terminal-clipboard.md for the two lines to add.
+  "terminal.integrated.sendKeybindingsToShell": false,
+  "terminal.integrated.commandsToSkipShell": [
+    "workbench.action.terminal.paste",
+    "workbench.action.terminal.copySelection",
+    "workbench.action.terminal.selectAll"
+  ],
+  // Right-click keeps working as a fallback, but should no longer be the only way.
+  "terminal.integrated.rightClickBehavior": "paste",
+  // Multi-line pastes into Claude Code should not pop a confirmation each time.
+  "terminal.integrated.enableMultiLinePasteWarning": "never",
+  // zellij redraws heavily; a larger buffer avoids losing scrollback on resize.
+  "terminal.integrated.scrollback": 20000
+}

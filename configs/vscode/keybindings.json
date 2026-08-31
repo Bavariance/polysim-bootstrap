@@ -1,0 +1,20 @@
+// VS Code CLIENT-side keybindings — terminal copy/paste that works over Remote-SSH.
+//
+// These CANNOT be set from the remote host: keybindings.json lives on your laptop.
+// Open the palette (F1) -> "Preferences: Open Keyboard Shortcuts (JSON)" and add
+// these entries. Copy them from THIS EDITOR TAB, not from the terminal — which is
+// the whole point, since the terminal is what is broken.
+//
+// Why each one:
+//  - ctrl+v  : the binding you actually reach for. VS Code sends it to the shell by
+//              default on Linux, which is why nothing happens inside zellij.
+//  - ctrl+shift+v : same command, so muscle memory from other terminals works. Without
+//              this, Claude Code receives the raw key and offers to paste an image.
+//  - ctrl+shift+c : copy. NOT ctrl+c — that must stay SIGINT inside the terminal.
+//
+// `terminalFocus` scopes them to the terminal, so editor copy/paste is untouched.
+[
+  { "key": "ctrl+v",       "command": "workbench.action.terminal.paste",        "when": "terminalFocus" },
+  { "key": "ctrl+shift+v", "command": "workbench.action.terminal.paste",        "when": "terminalFocus" },
+  { "key": "ctrl+shift+c", "command": "workbench.action.terminal.copySelection","when": "terminalFocus && terminalTextSelected" }
+]
