@@ -507,7 +507,9 @@ serialization_interval 60
 themes {
     gnome-dark {
         fg "#9a9996"
-        bg "#1c1c1f"
+        // Zellij paints mouse selections in "bg". It must differ from the terminal background (#1c1c1f),
+        // or selected text is invisible.
+        bg "#404552"
         black "#1c1c1f"
         red "#ed333b"
         green "#2ec27e"
