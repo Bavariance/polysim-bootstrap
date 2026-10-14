@@ -176,6 +176,9 @@ keybinds clear-defaults=true {
         bind "esc" { SwitchToMode "locked"; }
     }
     shared_among "normal" "locked" {
+        // Ctrl+Shift+C copies the Zellij selection (also copied on release). Without this, Ghostty finds no
+        // selection of its own and passes the key on, and programs get Ctrl+C: a shell prints ^C, Claude is interrupted.
+        bind "Ctrl Shift c" { Copy; }
         bind "Alt n" { NewPane; }
         bind "Alt f" { ToggleFloatingPanes; }
         bind "Alt i" { MoveTab "Left"; }
