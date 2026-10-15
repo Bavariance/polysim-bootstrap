@@ -1,0 +1,36 @@
+// agent-tab: ONE fresh agent tab (claude + shell + git) for a session that already exists.
+// Bound to Ctrl+G a in config.kdl. Zellij new-tab with the full agent-session layout only adds
+// a second "watch" tab (tested 2026-10-15), hence this single-tab copy.
+// The agent tab below is copied from agent-session.kdl: change both together.
+
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        children
+        pane size=2 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+
+    tab name="agent" focus=true split_direction="vertical" {
+        pane name="claude" command="bash" focus=true size="72%" start_suspended=false {
+            // -ic, NOT -lc. `claude` is installed through fnm, which initialises in
+            // .bashrc (interactive) and NOT in the login-profile chain, so `bash -lc`
+            // gives "claude: command not found" unless the zellij SERVER happened to
+            // inherit a PATH that already had it. That inheritance is why zpoly works
+            // and why this broke the moment the session was created from elsewhere.
+            // An interactive shell sources .bashrc and resolves it every time.
+            // Falls back to an interactive shell if the agent exits, instead of
+            // leaving a dead pane you cannot type into.
+            args "-ic" "${AGENT_CMD:-claude --dangerously-skip-permissions}; exec bash -i"
+        }
+        pane name="ops" split_direction="horizontal" size="28%" {
+            pane name="shell · Ctrl+G a = new agent tab"
+            pane name="git" command="bash" start_suspended=true {
+                args "-lc" "git status -sb; exec bash -l"
+            }
+        }
+    }
+}

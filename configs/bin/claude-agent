@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# claude-agent: the agent pane's command (AGENT_CMD, set in bashrc/zshrc). Same script as portus tooling bin/claude-agent.
+# Resumes this folder's latest Claude conversation, so a resurrected Zellij session picks up where it
+# stopped. Starts a new conversation when there is none yet, or when another claude already runs in this
+# folder, because two processes must not write to one conversation.
+# CLAUDE_AGENT_DRYRUN=1 prints the command instead of running it.
+here=$(pwd -P)
+convs="$HOME/.claude/projects/$(printf '%s' "$here" | sed 's|[^A-Za-z0-9]|-|g')"
+busy=""
+for p in /proc/[0-9]*; do
+  [ "$p" = "/proc/$$" ] && continue
+  if [ "$(cat "$p/comm" 2>/dev/null)" = claude ] && [ "$(readlink "$p/cwd" 2>/dev/null)" = "$here" ]; then busy=1; break; fi
+done
+if [ -z "$busy" ] && compgen -G "$convs/*.jsonl" >/dev/null; then
+  cmd=(claude --dangerously-skip-permissions --continue "$@")
+else
+  [ -n "$busy" ] && echo "claude-agent: Claude is already running in $here, so this starts a new conversation." >&2
+  cmd=(claude --dangerously-skip-permissions "$@")
+fi
+[ -n "${CLAUDE_AGENT_DRYRUN:-}" ] && { echo "${cmd[*]}"; exit 0; }
+exec "${cmd[@]}"

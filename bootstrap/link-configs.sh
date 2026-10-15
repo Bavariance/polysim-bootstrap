@@ -47,5 +47,8 @@ link "$REPO_ROOT/configs/direnv/direnvrc"                    "$HOME/.config/dire
 link "$REPO_ROOT/configs/polysim/shell-init.sh"              "$HOME/.config/polysim/shell-init.sh"
 link "$REPO_ROOT/configs/zellij/config.kdl"                  "$HOME/.config/zellij/config.kdl"
 link "$REPO_ROOT/configs/zellij/layouts/polysimulator.kdl"   "$HOME/.config/zellij/layouts/polysimulator.kdl"
+link "$REPO_ROOT/configs/zellij/layouts/agent-session.kdl"   "$HOME/.config/zellij/layouts/agent-session.kdl"
+link "$REPO_ROOT/configs/zellij/layouts/agent-tab.kdl"       "$HOME/.config/zellij/layouts/agent-tab.kdl"
+link "$REPO_ROOT/configs/bin/claude-agent"                   "$HOME/.local/bin/claude-agent"
 
 log "Done. Open a new shell to pick up the new configs."

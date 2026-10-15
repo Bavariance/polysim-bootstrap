@@ -49,7 +49,7 @@ layout {
             args "-ic" "${AGENT_CMD:-claude --dangerously-skip-permissions}; exec bash -i"
         }
         pane name="ops" split_direction="horizontal" size="28%" {
-            pane name="shell"
+            pane name="shell · Ctrl+G a = new agent tab"
             pane name="git" command="bash" start_suspended=true {
                 args "-lc" "git status -sb; exec bash -l"
             }

@@ -117,6 +117,8 @@ zpoly_reset() {
 #
 # After creating a session, run /rc inside it once to enable Remote Control if
 # you want it reachable from the phone - that is per-session and not scriptable.
+# Agent panes resume the folder's latest conversation (configs/bin/claude-agent).
+export AGENT_CMD="${AGENT_CMD:-claude-agent}"
 zagent() {
   local name="${1:?usage: zagent <session-name> [dir]}"
   local dir="${2:-$HOME/projects/$name}"
@@ -129,6 +131,11 @@ zagent() {
 }
 zagent_reset() {
   local name="${1:?usage: zagent_reset <session-name> [dir]}"
+  if [ "${ZELLIJ_SESSION_NAME:-}" = "$name" ]; then
+    printf "zagent_reset: you are inside %s; resetting it from here would kill this shell halfway.\n" "$name" >&2
+    printf "  Ctrl+G a opens a fresh agent tab here instead, or detach (Ctrl+G o d) and run it again.\n" >&2
+    return 1
+  fi
   zellij kill-session "$name" 2>/dev/null || true
   zellij delete-session "$name" 2>/dev/null || true
   zagent "$@"

@@ -1,10 +1,13 @@
 // Zellij's "Unlock-First (non-colliding)" preset (zellij 0.44.1, default-plugins/configuration/src/presets.rs),
 // same scheme as portus: Claude Code keeps Ctrl+O, Ctrl+B, Ctrl+T, Ctrl+S. Zellij starts locked; Ctrl+G then
-// one letter (p pane, t tab, r resize, m move, s scroll, o session); Esc locks again. Detach = Ctrl+G o d.
+// one letter (p pane, t tab, r resize, m move, s scroll, o session); Esc locks again. Detach = Ctrl+G o d. Ctrl+G a = fresh agent tab.
 // Alt+n new pane, Alt+h/j/k/l focus, Alt+f floating work while locked.
 default_mode "locked"
 keybinds clear-defaults=true {
     normal {
+        // Ctrl+G a: a fresh agent tab (claude + shell + git) in the session you are looking at, e.g. when
+        // the claude pane died. Nothing is closed: close the old tab yourself (Ctrl+G t x).
+        bind "a" { NewTab { layout "agent-tab"; name "agent"; }; SwitchToMode "Locked"; }
     }
     locked {
         bind "Ctrl g" { SwitchToMode "Normal"; }
