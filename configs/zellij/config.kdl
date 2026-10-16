@@ -64,7 +64,8 @@ keybinds clear-defaults=true {
         bind "l" "Right" "Down" "j" { GoToNextTab; }
         bind "n" { NewTab; SwitchToMode "Locked"; }
         bind "x" { CloseTab; SwitchToMode "Locked"; }
-        bind "s" { ToggleActiveSyncTab; SwitchToMode "Locked"; }
+        // No "s" = sync-input: after a stray Ctrl+G, typing "test" went t = tab mode, s = sync on, and every
+        // later key reached all panes of the tab (2026-10-16). If ever wanted: zellij action toggle-active-sync-tab
         bind "b" { BreakPane; SwitchToMode "Locked"; }
         bind "]" { BreakPaneRight; SwitchToMode "Locked"; }
         bind "[" { BreakPaneLeft; SwitchToMode "Locked"; }
