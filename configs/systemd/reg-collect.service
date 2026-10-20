@@ -1,0 +1,16 @@
+[Unit]
+Description=Session registry collector (reg collect, every 30 s)
+Documentation=https://claude.ai/code/artifact/a828a4fa-5c67-4630-9e48-732fbd84649d
+After=network-online.target
+
+# Same file on globus (polysim-bootstrap configs/systemd/reg-collect.service). One Python process for the
+# service's life; on portus it also keeps one SSH connection to globus open between ticks.
+[Service]
+ExecStart=%h/.local/bin/reg collect --every 30
+Restart=always
+RestartSec=30
+Nice=10
+MemoryMax=64M
+
+[Install]
+WantedBy=default.target

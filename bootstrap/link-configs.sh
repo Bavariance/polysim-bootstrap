@@ -50,6 +50,8 @@ link "$REPO_ROOT/configs/zellij/layouts/polysimulator.kdl"   "$HOME/.config/zell
 link "$REPO_ROOT/configs/zellij/layouts/agent-session.kdl"   "$HOME/.config/zellij/layouts/agent-session.kdl"
 link "$REPO_ROOT/configs/zellij/layouts/agent-tab.kdl"       "$HOME/.config/zellij/layouts/agent-tab.kdl"
 link "$REPO_ROOT/configs/bin/claude-agent"                   "$HOME/.local/bin/claude-agent"
+link "$REPO_ROOT/configs/bin/reg"                            "$HOME/.local/bin/reg"
+link "$REPO_ROOT/configs/systemd/reg-collect.service"         "$HOME/.config/systemd/user/reg-collect.service"
 link "$REPO_ROOT/configs/claude/keybindings.json"           "$HOME/.claude/keybindings.json"
 
 log "Done. Open a new shell to pick up the new configs."

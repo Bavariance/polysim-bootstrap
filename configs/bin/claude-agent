@@ -3,19 +3,46 @@
 # Resumes this folder's latest Claude conversation, so a resurrected Zellij session picks up where it
 # stopped. Starts a new conversation when there is none yet, or when another claude already runs in this
 # folder, because two processes must not write to one conversation.
+#   claude-agent --id UUID NAME   one conversation of its own (the hub's "fresh conversation"): the first
+#                                 run starts it empty under that id, named NAME with Remote Control on;
+#                                 every later run resumes it.
+# Either way the conversation id is fixed here and claude runs under `reg run`, which resumes that id on every
+# start and after a `reg restart` (the session restarting itself onto a new Claude Code). Zellij saves the
+# pane's command as `reg run --id ...`, so a resurrected pane comes back to the same conversation.
 # CLAUDE_AGENT_DRYRUN=1 prints the command instead of running it.
 here=$(pwd -P)
 convs="$HOME/.claude/projects/$(printf '%s' "$here" | sed 's|[^A-Za-z0-9]|-|g')"
-busy=""
-for p in /proc/[0-9]*; do
-  [ "$p" = "/proc/$$" ] && continue
-  if [ "$(cat "$p/comm" 2>/dev/null)" = claude ] && [ "$(readlink "$p/cwd" 2>/dev/null)" = "$here" ]; then busy=1; break; fi
-done
-if [ -z "$busy" ] && compgen -G "$convs/*.jsonl" >/dev/null; then
-  cmd=(claude --dangerously-skip-permissions --continue "$@")
-else
-  [ -n "$busy" ] && echo "claude-agent: Claude is already running in $here, so this starts a new conversation." >&2
-  cmd=(claude --dangerously-skip-permissions "$@")
+running() {   # PATTERN: is a claude process running here whose command line matches it?
+  local p
+  for p in /proc/[0-9]*; do
+    [ "$p" = "/proc/$$" ] && continue
+    [ "$(cat "$p/comm" 2>/dev/null)" = claude ] && [ "$(readlink "$p/cwd" 2>/dev/null)" = "$here" ] \
+      && tr '\0' ' ' <"$p/cmdline" 2>/dev/null | grep -q -- "$1" && return 0
+  done
+  return 1
+}
+# A second agent tab (Ctrl+G a) in that Zellij session gets the same --id: it must not resume a conversation
+# that is already open, so it falls through to a new conversation below.
+if [ "${1:-}" = --id ] && [ -n "${2:-}" ] && running "$2"; then
+  shift 3
+elif [ "${1:-}" = --id ]; then
+  id="${2:?usage: claude-agent --id UUID NAME}" name="${3:?usage: claude-agent --id UUID NAME}"; shift 3
 fi
+if [ -z "${id:-}" ]; then
+  latest=$(ls -t "$convs"/*.jsonl 2>/dev/null | head -1)
+  if running ''; then
+    echo "claude-agent: Claude is already running in $here, so this starts a new conversation." >&2
+  elif [ -n "$latest" ]; then
+    id=$(basename "$latest" .jsonl) name=""   # the folder's latest conversation, as --continue would pick it
+  fi
+fi
+if [ -z "${id:-}" ]; then                      # a new conversation, named by the handle reg gives it
+  id=$(cat /proc/sys/kernel/random/uuid)
+  base=$([ "$here" = "$HOME" ] && echo home || basename "$here" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//' | cut -c1-24 | sed -E 's/-+$//')
+  name="${base:-session}-${id:0:4}"
+fi
+# A resurrected pane runs without .bashrc, and globus has claude only through fnm.
+command -v claude >/dev/null || PATH="$HOME/.local/share/fnm/aliases/default/bin:$PATH"
+cmd=(reg run --id "$id" ${name:+--name "$name"} -- --dangerously-skip-permissions "$@")
 [ -n "${CLAUDE_AGENT_DRYRUN:-}" ] && { echo "${cmd[*]}"; exit 0; }
 exec "${cmd[@]}"

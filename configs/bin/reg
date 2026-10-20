@@ -1,0 +1,1549 @@
+#!/usr/bin/env python3
+"""reg: the session registry. Every Claude session on portus and globus, with a handle that never changes.
+
+  reg list [--all] [--json]   live sessions, then offline ones seen in the last 7 days (--all: every one)
+  reg who NAME [--json]       the session(s) a name means, and the address to send it a message to
+  reg note                    SessionStart hook: tells a session its own handle and how to reach the others
+  reg changelog [FROM [TO]]   what changed in Claude Code between two versions; by default between the version
+                              the calling session runs and the one installed on this machine (--all: no cut)
+  reg update-note             UserPromptSubmit hook: tells a session once per installed version that it runs an older one
+  reg run --id UUID [--name N] [--keep] [-- FLAGS]
+                              supervisor for one conversation: the terminal pane runs this instead of claude. It resumes
+                              the conversation on every start and starts it again after `reg restart`
+  reg restart --check | --in 10m|--at HH:MM|--now --reason TEXT [--force] | --cancel | --status
+                              run by a session on itself: restart onto the installed Claude Code at a safe moment
+  reg side-notes [NAME] [--all]
+                              side-agent notes ("Heads up") offered on this machine in the last 7 days, whole, also
+                              the ones dismissed; NAME: only that session's
+  reg side-notes --hook       UserPromptSubmit and PostToolUse hook: gives a session the notes it has not had yet
+  reg compact [--text T | --file F] [--then PROMPT] [--force] | --cancel | --status
+                              run by a session on itself: once it is idle, type /compact with its own instructions into
+                              its terminal pane, then a prompt that tells it to carry on
+  reg collect [--every N]     one collector tick, or one every N seconds (reg-collect.service runs --every 30); between
+                              ticks it copies side-agent notes out of Claude Code's store every 2 s
+
+Design: https://claude.ai/code/artifact/a828a4fa-5c67-4630-9e48-732fbd84649d (Session Registry Design)
+
+Each machine's collector reads Claude's own ~/.claude/sessions/<pid>.json (never the *.key files beside them)
+and writes <machine>.json to ~/.local/state/session-registry. globus is the authority: it merges its own file
+and portus's into registry.json. portus pushes its file to globus over SSH and pulls registry.json back as a
+read-only copy. On globus a tick is this one Python process and no subprocess: its watchdog resets the Pi
+under memory pressure, so nothing here forks or greps.
+
+A handle is made once, at a session's first sight: its folder's name plus the first four characters of its
+conversation id (erik-business-f258; a session in the home folder is home-13d4). It never changes and is
+never reused. Python 3.11 compatible (globus runs Debian 12).
+"""
+import datetime
+import glob
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+SESSIONS = os.path.join(HOME, ".claude", "sessions")
+STATE = os.environ.get("REG_STATE") or os.path.join(HOME, ".local", "state", "session-registry")
+AUTHORITY = "globus"
+MACHINE = socket.gethostname().split(".")[0]
+STALE = 120                   # a machine whose file is older than this is "not heard from"
+KEEP_DAYS = 30                # offline sessions are dropped from the registry after this
+LIST_DAYS = 7                 # reg list shows offline sessions seen within this
+# Launch flags worth keeping, so a session can later be started again the way it ran. Values are kept only for
+# these; everything else on the command line (a prompt, a path) is left out.
+FLAG_VALUES = {"--permission-mode", "--model", "--effort", "--append-system-prompt-file", "--add-dir", "--agent"}
+FLAG_BARE = {"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--chrome", "--no-chrome"}
+# Where a new session gets its claude from: the native installer's versions/<v> link (portus) or the npm package
+# under fnm (globus). The first that exists is this machine's installed version.
+CLAUDE_BINS = (os.path.join(HOME, ".local", "bin", "claude"),
+               os.path.join(HOME, ".local", "share", "fnm", "aliases", "default", "bin", "claude"))
+CHANGELOG_URL = "https://raw.githubusercontent.com/anthropics/claude-code/refs/heads/main/CHANGELOG.md"
+CHANGELOG_CACHE = os.path.join(HOME, ".claude", "cache", "changelog.md")   # Claude Code keeps this copy itself
+
+
+def read(path: str, binary: bool = False):
+    with open(path, "rb" if binary else "r") as f:
+        return f.read()
+
+
+def write_json(path: str, obj) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def load_json(path: str, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+# --- collecting -------------------------------------------------------------------------------------------
+
+def proc_start(pid: int) -> str:
+    """The process's start time in clock ticks (field 22 of /proc/<pid>/stat), as Claude records it in
+    procStart: a leftover session file whose pid was reused does not match."""
+    stat = read(f"/proc/{pid}/stat")
+    return stat[stat.rindex(")") + 2:].split()[19]
+
+
+def terminal(pid: int, d: dict) -> str:
+    if d.get("kind") == "bg":
+        return "background"
+    try:                                           # only the Zellij variables and tmux's socket are kept from it
+        env = dict(kv.split(b"=", 1) for kv in read(f"/proc/{pid}/environ", True).split(b"\0") if b"=" in kv)
+    except OSError:
+        env = {}
+    if d.get("tmux"):                              # TMUX is "<socket path>,<server pid>,<session index>"
+        socket = os.path.basename(env.get(b"TMUX", b"").split(b",")[0].decode(errors="replace"))
+        return f"tmux {d['tmux']}" + (f" (tmux -L {socket})" if socket and socket != "default" else "")
+    if b"ZELLIJ_SESSION_NAME" in env:
+        return f"zellij {env[b'ZELLIJ_SESSION_NAME'].decode(errors='replace')} #{env.get(b'ZELLIJ_PANE_ID', b'?').decode()}"
+    return "terminal"
+
+
+def argv(pid: int) -> list:
+    try:
+        return [a.decode(errors="replace") for a in read(f"/proc/{pid}/cmdline", True).split(b"\0")[1:]]
+    except OSError:
+        return []
+
+
+def launch_name(args: list) -> str:
+    """The name given with --remote-control NAME (its value is optional) or --name NAME, e.g. "TUM Studium"."""
+    for i, a in enumerate(args):
+        if a.startswith(("--remote-control=", "--name=")):
+            return a.split("=", 1)[1]
+        if a in ("--remote-control", "--name", "-n") and i + 1 < len(args) and not args[i + 1].startswith("-"):
+            return args[i + 1]
+    return ""
+
+
+def flags(args: list) -> list:
+    out = []
+    for i, a in enumerate(args):
+        if a in FLAG_BARE:
+            out.append(a)
+        elif a in FLAG_VALUES and i + 1 < len(args):
+            out += [a, args[i + 1]]
+        elif a.split("=", 1)[0] in FLAG_VALUES:
+            out.append(a)
+    return out
+
+
+def branch(cwd: str) -> str:
+    """The checked-out branch of the git repository that holds cwd, read from .git/HEAD (no git process)."""
+    d = cwd
+    while d.startswith(HOME) and d != HOME:
+        git = os.path.join(d, ".git")
+        try:
+            if os.path.isfile(git):                # a worktree: ".git" names the real git dir
+                git = read(git).split("gitdir:", 1)[1].strip()
+                git = git if os.path.isabs(git) else os.path.join(d, git)
+            if os.path.isdir(git):
+                head = read(os.path.join(git, "HEAD")).strip()
+                return head[len("ref: refs/heads/"):] if head.startswith("ref: refs/heads/") else head[:8]
+        except (OSError, IndexError):
+            return ""
+        d = os.path.dirname(d)
+    return ""
+
+
+def title(cwd: str, sid: str) -> str:
+    """The conversation's newest title (set with --name or /rename, else Claude's own), from the end of its file."""
+    path = os.path.join(HOME, ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd), f"{sid}.jsonl")
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, os.path.getsize(path) - 262144))
+            lines = f.read().splitlines()
+    except OSError:
+        return ""
+    for raw in reversed(lines):
+        if b'"custom-title"' in raw or b'"ai-title"' in raw:
+            try:
+                o = json.loads(raw)
+            except ValueError:
+                continue
+            t = o.get("customTitle") or o.get("aiTitle")
+            if t:
+                return str(t)[:120]
+    return ""
+
+
+def snapshot() -> list:
+    """Every live Claude session on this machine, from its session file."""
+    out = []
+    for path in glob.glob(os.path.join(SESSIONS, "*.json")):
+        d = load_json(path, None)
+        if not isinstance(d, dict) or not d.get("sessionId") or not d.get("pid"):
+            continue
+        pid = int(d["pid"])
+        try:
+            if d.get("procStart") and proc_start(pid) != str(d["procStart"]):
+                continue
+        except (OSError, ValueError, IndexError):
+            continue                               # the process is gone; Claude left its file behind
+        cwd = d.get("cwd") or ""
+        args = argv(pid)
+        out.append({
+            "id": d["sessionId"], "pid": pid, "machine": MACHINE, "cwd": cwd,
+            "name": d.get("name") or "", "name_source": d.get("nameSource") or "",
+            "kind": d.get("kind") or "", "status": d.get("status") or "",
+            "bridge": d.get("bridgeSessionId") or "", "version": d.get("version") or "",
+            "started_at": (d.get("startedAt") or 0) / 1000, "terminal": terminal(pid, d),
+            "flags": flags(args), "launch_name": launch_name(args), "branch": branch(cwd),
+            "title": title(cwd, d["sessionId"]),
+        })
+    return out
+
+
+def installed_version() -> str:
+    """The Claude Code version a session started now would run."""
+    for path in CLAUDE_BINS:
+        real = os.path.realpath(path)
+        if not os.path.exists(real):
+            continue
+        m = re.search(r"/versions/(\d+\.\d+\.\d+)$", real)
+        if m:
+            return m.group(1)
+        d = os.path.dirname(real)
+        for _ in range(3):                         # .../@anthropic-ai/claude-code/bin/claude.exe -> package.json
+            pkg = load_json(os.path.join(d, "package.json"), None)
+            if isinstance(pkg, dict) and pkg.get("name") == "@anthropic-ai/claude-code":
+                return str(pkg.get("version") or "")
+            d = os.path.dirname(d)
+    return ""
+
+
+def vkey(v: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", v or "")[:3]) or (0,)
+
+
+def make_handle(cwd: str, sid: str, taken: set) -> str:
+    base = "home" if cwd.rstrip("/") in (HOME, "") else os.path.basename(cwd.rstrip("/"))
+    base = re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", base.lower())).strip("-")[:24].rstrip("-") or "session"
+    for n in (4, 6, 8, 12):                        # two ids sharing a prefix in one folder: a longer suffix
+        h = f"{base}-{sid.replace('-', '')[:n]}"
+        if h not in taken:
+            return h
+    return f"{base}-{sid}"
+
+
+def merge(reg: dict, machines: dict, now: float) -> dict:
+    """Fold each machine's snapshot into the registry. machines = {name: (sessions, fresh)}."""
+    entries = reg.setdefault("sessions", {})
+    taken = {e.get("handle") for e in entries.values()}
+    for machine, (sessions, fresh) in machines.items():
+        seen = set()
+        for s in sessions:
+            e = entries.get(s["id"])
+            if e is None:
+                e = entries[s["id"]] = {"id": s["id"], "first_seen": now, "handle": make_handle(s["cwd"], s["id"], taken)}
+                taken.add(e["handle"])
+            e.update(s)
+            e["state"] = "live" if fresh else "unknown"
+            if fresh:
+                e["last_seen"] = now
+            seen.add(s["id"])
+        for e in entries.values():
+            if e.get("machine") == machine and e["id"] not in seen:
+                e["state"] = "offline" if fresh else ("unknown" if e.get("state") == "live" else e.get("state"))
+                e["status"] = ""
+    for sid in [k for k, e in entries.items() if e.get("state") == "offline"
+                and now - e.get("last_seen", now) > KEEP_DAYS * 86400]:
+        del entries[sid]
+    reg.setdefault("machines", {}).update({m: {"fresh": f, "sessions": len(s)} for m, (s, f) in machines.items()})
+    return reg
+
+
+def push_pull(snap: dict) -> None:
+    """portus: hand this machine's file to globus and take registry.json back, in one SSH call. The connection
+    stays open between ticks (ControlPersist), so globus sees one login, not one every 30 s."""
+    remote = ('d="$HOME/.local/state/session-registry"; mkdir -p "$d" && cat > "$d/.{m}.json.tmp" && '
+              'mv "$d/.{m}.json.tmp" "$d/{m}.json" && cat "$d/registry.json" 2>/dev/null; true').format(m=MACHINE)
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    cmd = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ForwardAgent=no",
+           "-o", "ClearAllForwardings=yes", "-o", "ControlMaster=auto", "-o", f"ControlPath={runtime}/reg-ssh-%C",
+           "-o", "ControlPersist=5m", AUTHORITY, remote]
+    status = {"at": time.time()}
+    try:
+        p = subprocess.run(cmd, input=json.dumps(snap).encode(), capture_output=True, timeout=25)
+        reg = json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else None
+        if isinstance(reg, dict):
+            write_json(os.path.join(STATE, "registry.json"), reg)
+            status["ok"] = True
+        else:
+            err = p.stderr.decode(errors="replace").strip() or (f"exit {p.returncode}" if p.returncode else "globus has no registry.json yet")
+            status.update(ok=False, error=err[-300:])
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        status.update(ok=False, error=str(e)[-300:])
+    write_json(os.path.join(STATE, "sync.json"), status)
+
+
+def collect_once() -> None:
+    now = time.time()
+    snap = {"machine": MACHINE, "ts": now, "sessions": snapshot(), "installed": installed_version()}
+    write_json(os.path.join(STATE, f"{MACHINE}.json"), snap)
+    if MACHINE != AUTHORITY:
+        push_pull(snap)
+        return
+    machines = {MACHINE: (snap["sessions"], True)}
+    installed = {MACHINE: snap["installed"]}
+    for path in glob.glob(os.path.join(STATE, "*.json")):
+        name = os.path.basename(path)[:-5]
+        if name in (MACHINE, "registry", "sync"):
+            continue
+        other = load_json(path, {})
+        if other.get("machine") != name:           # only a machine's own snapshot, nothing else kept here
+            continue
+        try:
+            fresh = now - os.path.getmtime(path) < STALE
+        except OSError:
+            continue
+        machines[name] = (other.get("sessions") or [], fresh)
+        installed[name] = other.get("installed") or ""
+    path = os.path.join(STATE, "registry.json")
+    reg = load_json(path, {})
+    reg["machines"] = {}                           # only the machines that sent a file this time
+    reg = merge(reg, machines, now)
+    for name, v in installed.items():
+        reg["machines"][name]["installed"] = v
+    reg["updated"] = now
+    write_json(path, reg)
+
+
+def cmd_collect(args: list) -> None:
+    every = int(args[args.index("--every") + 1]) if "--every" in args else 0
+    looked = {}
+    while True:
+        start = time.time()
+        try:
+            collect_once()
+        except Exception as e:                     # a bad tick must not end the service; the next one retries
+            print(f"reg collect: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        while True:                                # between ticks, look for side-agent notes every NOTE_POLL seconds
+            try:
+                archive_notes(looked)
+            except Exception as e:
+                print(f"reg collect: notes: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            if not every or time.time() - start > every - NOTE_POLL:
+                break
+            time.sleep(NOTE_POLL)
+        if not every:
+            return
+        time.sleep(max(0.0, every - (time.time() - start)))
+
+
+# --- side-agent notes -------------------------------------------------------------------------------------
+# Claude Code's side agent offers Erik notes about a session ("Heads up"). One he dismisses never reaches the
+# session, and the store then keeps only its headline. So the collector copies each note into notes.jsonl
+# while it is on offer and flags its session (pending/<session id>); the hook gives the session every note it
+# has not had yet. The hook command tests the flag in the shell first, so Python starts only when one waits.
+NOTE_STORES = os.path.join(HOME, ".claude", "plugins", "store", "cc-plugin-you-should-know_builtin-*.json")
+NOTES = os.path.join(STATE, "side-notes")
+NOTE_POLL = 2                 # seconds between looks at the store: a note can be dismissed within seconds
+NOTE_CAP = 9000               # Claude Code cuts a hook's output at 10,000 characters
+
+
+def archive_notes(looked: dict) -> None:
+    """Copies each note on offer into notes.jsonl, once. looked: {store: mtime}; an unchanged store is not read."""
+    for store in glob.glob(NOTE_STORES):
+        try:
+            mtime = os.path.getmtime(store)
+        except OSError:
+            continue
+        if looked.get(store) == mtime:
+            continue
+        data = load_json(store, None)
+        if data is None:                           # caught while Claude Code rewrote it; the next look reads it
+            continue
+        looked[store] = mtime
+        have = {(n.get("session"), n.get("line")) for n in archived_notes()}
+        for s in data.get("sessions") or []:
+            v, sid = s.get("view") or {}, s.get("id") or ""
+            line = " ".join(str(v.get("line") or "").split())
+            if not sid or not line or (sid, line) in have:
+                continue
+            note = {"at": time.time(), "machine": MACHINE, "session": sid, "tag": s.get("tag") or "",
+                    "line": line, "explanation": str(v.get("explanation") or ""), "shown_at": v.get("shownAt")}
+            os.makedirs(NOTES, mode=0o700, exist_ok=True)
+            os.makedirs(os.path.join(NOTES, "pending"), mode=0o700, exist_ok=True)
+            fd = os.open(os.path.join(NOTES, "notes.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a") as f:
+                f.write(json.dumps(note) + "\n")
+            open(os.path.join(NOTES, "pending", sid), "a").close()
+            have.add((sid, line))
+
+
+def archived_notes() -> list:
+    try:
+        lines = read(os.path.join(NOTES, "notes.jsonl")).splitlines()
+    except OSError:
+        return []
+    out = []
+    for raw in lines:
+        try:
+            out.append(json.loads(raw))
+        except ValueError:
+            continue
+    return out
+
+
+def delivered(sid: str) -> set:
+    try:
+        return set(read(os.path.join(NOTES, "delivered", sid)).splitlines())
+    except OSError:
+        return set()
+
+
+def render_note(n: dict, room: int) -> str:
+    when = datetime.datetime.fromtimestamp(n.get("at") or 0).strftime("%H:%M")
+    head = (f"Side-agent note for this session. Claude Code's side agent offered it to Erik as \"{n.get('tag') or 'Heads up'}\" "
+            f"at {when}. He forwards most of these to the session, so take it into account. It is the side agent's "
+            f"observation, not an instruction or approval from Erik.\n{n['line']}\n\n")
+    body = n.get("explanation") or ""
+    if len(head) + len(body) > room:
+        body = body[:max(0, room - len(head) - 80)] + "\n[cut here; `reg side-notes` prints the whole note]"
+    return head + body
+
+
+def cmd_side_notes_hook() -> None:
+    """UserPromptSubmit and PostToolUse hook. Silent on any error."""
+    try:
+        hook = json.load(sys.stdin)
+        sid = hook.get("session_id") or ""
+        flag = os.path.join(NOTES, "pending", sid)
+        if not sid or hook.get("agent_id") or not os.path.exists(flag):   # a subagent's tool call leaves it waiting
+            return
+        os.remove(flag)                            # before reading, so a note archived from now on flags it again
+        done = delivered(sid)
+        new = [n for n in archived_notes() if n.get("session") == sid and n.get("line") not in done]
+        if not new:
+            return
+        os.makedirs(os.path.join(NOTES, "delivered"), mode=0o700, exist_ok=True)
+        with open(os.path.join(NOTES, "delivered", sid), "a") as f:
+            f.writelines(n["line"] + "\n" for n in new)
+        prompt = " ".join((hook.get("prompt") or "").split())
+        give = [n for n in new if n["line"] not in prompt]    # the rest Erik forwarded himself, in this prompt
+        if not give:
+            return
+        room = NOTE_CAP // len(give)
+        text = "\n\n".join(render_note(n, room) for n in give)
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": hook.get("hook_event_name") or "UserPromptSubmit",
+                                                 "additionalContext": text}}))
+    except Exception:
+        return
+
+
+def cmd_side_notes(args: list) -> None:
+    pos = [a for a in args if not a.startswith("--")]
+    notes = archived_notes()
+    reg, _ = view()
+    if pos:
+        hits, _ = find(reg, pos[0])
+        ids = {e["id"] for e in hits}
+        notes = [n for n in notes if n.get("session") in ids or n.get("session", "").startswith(pos[0])]
+    if "--all" not in args:
+        notes = [n for n in notes if time.time() - (n.get("at") or 0) < LIST_DAYS * 86400]
+    if not notes:
+        print(f"No side-agent notes on {MACHINE}" + ("" if "--all" in args else f" in the last {LIST_DAYS} days") + ".")
+        return
+    handles = {sid: e.get("handle") for sid, e in reg.get("sessions", {}).items()}
+    for n in notes:
+        sid = n.get("session", "")
+        state = "given to the session" if n["line"] in delivered(sid) else "waiting"
+        when = datetime.datetime.fromtimestamp(n.get("at") or 0).strftime("%Y-%m-%d %H:%M")
+        print(f"{when}  {handles.get(sid) or sid[:8]}  ({state})\n{n['line']}\n\n{n.get('explanation') or ''}\n\n---")
+
+
+# --- reading ----------------------------------------------------------------------------------------------
+
+def view() -> tuple:
+    """(registry, note): the registry, with this machine's own fresh file laid over a pulled copy."""
+    reg = load_json(os.path.join(STATE, "registry.json"), {})
+    note = ""
+    if MACHINE != AUTHORITY:
+        sync = load_json(os.path.join(STATE, "sync.json"), {})
+        if not sync.get("ok"):
+            note = f"globus not reached since the copy of {ago(reg.get('updated'))}: {sync.get('error', 'no sync yet')}"
+        own = load_json(os.path.join(STATE, f"{MACHINE}.json"), {})
+        if own.get("sessions") is not None and time.time() - own.get("ts", 0) < STALE:
+            merge(reg, {MACHINE: (own["sessions"], True)}, own["ts"])
+            reg["machines"][MACHINE]["installed"] = own.get("installed", "")
+    return reg, note
+
+
+def ago(t) -> str:
+    if not t:
+        return "never"
+    s = max(0, time.time() - t)
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= n:
+            return f"{int(s // n)}{unit} ago"
+    return "just now"
+
+
+def fit(s: str, w: int) -> str:
+    """Cut s to w characters in the middle, so the end (a pane number, a folder's last part) stays."""
+    return s if len(s) <= w else s[:w - len(s[-(w // 3):]) - 1] + "\u2026" + s[-(w // 3):]
+
+
+def short(path: str) -> str:
+    return "~" + path[len(HOME):] if path.startswith(HOME) else path
+
+
+def cmd_list(args: list) -> None:
+    reg, note = view()
+    now = time.time()
+    rows = [e for e in reg.get("sessions", {}).values()
+            if "--all" in args or e.get("state") != "offline" or now - e.get("last_seen", 0) < LIST_DAYS * 86400]
+    order = {"live": 0, "unknown": 1, "offline": 2}
+    rows.sort(key=lambda e: (order.get(e.get("state"), 3), e.get("machine", ""),
+                             -e.get("last_seen", 0) if e.get("state") != "live" else 0, e.get("handle", "")))
+    if "--json" in args:
+        json.dump(rows, sys.stdout, indent=1, sort_keys=True)
+        print()
+        return
+    if note:
+        print(f"note: {note}")
+    cols = ("HANDLE", "STATE", "MACHINE", "WHERE", "FOLDER", "RC", "NAME NOW")
+    table = []
+    for e in rows:
+        st = e.get("state", "")
+        state = (e.get("status") or "live") if st == "live" else f"{st} {ago(e.get('last_seen'))}"
+        table.append((e.get("handle", ""), state, e.get("machine", ""), e.get("terminal", ""),
+                      short(e.get("cwd", "")), "yes" if e.get("bridge") else "-", e.get("name", "")))
+    width = shutil.get_terminal_size((160, 40)).columns
+    w = [max([len(c)] + [len(r[i]) for r in table]) for i, c in enumerate(cols)]
+    w[3], w[4], w[6] = min(w[3], 36), min(w[4], 40), min(w[6], 48)
+    for r in [cols] + table:
+        line = "  ".join(fit(str(x), w[i]).ljust(w[i]) for i, x in enumerate(r))
+        print(line.rstrip()[:width])
+    print(f"\n{len(table)} sessions; registry updated {ago(reg.get('updated'))}"
+          + "".join(f"; {m} {'ok' if v.get('fresh') else 'not heard from'}" for m, v in sorted(reg.get("machines", {}).items())))
+    machines = reg.get("machines", {})
+    older = [e["handle"] for e in rows if e.get("state") == "live" and machines.get(e.get("machine"), {}).get("installed")
+             and vkey(machines[e["machine"]]["installed"]) > vkey(e.get("version", ""))]
+    print("Claude Code installed: " + ", ".join(f"{m} {v.get('installed') or '?'}" for m, v in sorted(machines.items()))
+          + (f"; {len(older)} live session{'s' if len(older) > 1 else ''} run an older version: {', '.join(older)}" if older else ""))
+
+
+def norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+
+def aliases(e: dict) -> dict:
+    """Every name a session goes by, as {kind: name}. Each machine shows other sessions under different names
+    (this session is vespucci-31 on portus and its Remote Control title on globus), so a person or a session may
+    use any of these."""
+    term = e.get("terminal", "")
+    where = term.split(" ")[1].split(":")[0] if term.startswith(("zellij ", "tmux ")) else ""
+    cwd = e.get("cwd", "").rstrip("/")
+    return {k: v for k, v in (("handle", e.get("handle", "")), ("peer name", e.get("name", "")),
+                              ("launch name", e.get("launch_name", "")), ("title", e.get("title", "")), (term.split(" ")[0] + " session", where),
+                              ("folder", "home" if cwd == HOME else os.path.basename(cwd))) if v}
+
+
+def mode(e: dict) -> str:
+    f = e.get("flags") or []
+    if "--dangerously-skip-permissions" in f or "bypassPermissions" in f:
+        return "bypass"
+    return f[f.index("--permission-mode") + 1] if "--permission-mode" in f[:-1] else "default (settings)"
+
+
+def address(e: dict) -> str:
+    if e.get("state") == "offline":
+        return f"none: offline since {ago(e.get('last_seen'))}, so a message fails until it runs again"
+    if e.get("bridge"):
+        return f"bridge:{e['bridge']}"
+    return f"{e.get('name')} (from {e.get('machine')} only: Remote Control is off)"
+
+
+def version_note(reg: dict, e: dict) -> str:
+    have, new = e.get("version", ""), reg.get("machines", {}).get(e.get("machine"), {}).get("installed", "")
+    if new and have and vkey(new) > vkey(have) and e.get("state") == "live":
+        return f"{have}, older than the installed {new} (reg changelog {have} {new})"
+    return have or "unknown"
+
+
+def find(reg: dict, query: str) -> tuple:
+    """(sessions, offline left out) the query names: the handle, else any other name exactly, else the start of a
+    conversation id, else any name containing it. When some of those are live, the offline ones are left out."""
+    q = norm(query)
+    hits = []
+    for e in reg.get("sessions", {}).values():
+        names = [norm(v) for v in aliases(e).values()]
+        if q == norm(e.get("handle", "")):
+            rank = 0
+        elif q in names:
+            rank = 1
+        elif len(q) >= 4 and e.get("id", "").replace("-", "").startswith(q.replace("-", "")):
+            rank = 2
+        elif q and any(q in n for n in names):
+            rank = 3
+        else:
+            continue
+        hits.append((rank, e.get("state") != "live", -e.get("last_seen", 0), e))
+    hits.sort(key=lambda h: h[:3])
+    best = [h[3] for h in hits if h[0] == hits[0][0]]
+    live = [e for e in best if e.get("state") == "live"]
+    return (live, len(best) - len(live)) if live else (best, 0)
+
+
+def cmd_who(args: list) -> None:
+    query = " ".join(a for a in args if a != "--json")
+    if not query:
+        print("usage: reg who NAME   (a handle, a Zellij or tmux session, a title, a folder, a peer name)", file=sys.stderr)
+        sys.exit(2)
+    reg, note = view()
+    hits, offline = find(reg, query)
+    if "--json" in args:
+        json.dump([dict(e, address=address(e), mode=mode(e)) for e in hits], sys.stdout, indent=1, sort_keys=True)
+        print()
+        return
+    if note:
+        print(f"note: {note}")
+    if not hits:
+        print(f"No session goes by \"{query}\". reg list shows them all.")
+        sys.exit(1)
+    if len(hits) > 1:
+        print(f"{len(hits)} sessions match \"{query}\"; pick one by its handle.\n")
+    for e in hits[:8]:
+        st = (e.get("status") or "live") if e.get("state") == "live" else f"{e.get('state')} {ago(e.get('last_seen'))}"
+        print(f"{e.get('handle')}  {st} on {e.get('machine')}, {e.get('terminal')}, {short(e.get('cwd', ''))}")
+        others = [f"{v} ({k})" for k, v in aliases(e).items() if k != "handle"]
+        print(f"  also called  {', '.join(others)}")
+        print(f"  launched in  {mode(e)} mode")
+        print(f"  version      {version_note(reg, e)}")
+        print(f"  send to      {address(e)}\n")
+    if len(hits) > 8:
+        print(f"... and {len(hits) - 8} more")
+    if offline:
+        print(f"({offline} offline session{'s' if offline > 1 else ''} by that name left out: reg list --all)")
+
+
+def own_session() -> dict:
+    """The session file of the Claude process this command runs under (its nearest claude ancestor), or {}."""
+    pid = os.getppid()
+    for _ in range(12):
+        d = load_json(os.path.join(SESSIONS, f"{pid}.json"), None)
+        if isinstance(d, dict) and d.get("sessionId"):
+            return d
+        try:
+            pid = int(read(f"/proc/{pid}/stat").rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return {}
+        if pid <= 1:
+            return {}
+    return {}
+
+
+def changelog_text(want: str) -> str:
+    """Claude Code's own cached changelog, or a fresh copy when the cache does not have version `want` yet."""
+    for path in (CHANGELOG_CACHE, os.path.join(STATE, "changelog.md")):
+        try:
+            text = read(path)
+        except OSError:
+            continue
+        if not want or f"\n## {want}\n" in text:
+            return text
+    import urllib.request                          # here, not at the top: the hooks start reg on every prompt
+    with urllib.request.urlopen(CHANGELOG_URL, timeout=20) as r:
+        text = r.read().decode()
+    os.makedirs(STATE, exist_ok=True)
+    with open(os.path.join(STATE, "changelog.md"), "w") as f:
+        f.write(text)
+    return text
+
+
+def cmd_changelog(args: list) -> None:
+    pos = [a for a in args if not a.startswith("--")]
+    own = own_session()
+    old = pos[0] if pos else own.get("version", "")
+    new = pos[1] if len(pos) > 1 else installed_version()
+    if not old or not new:
+        print("usage: reg changelog FROM [TO]   (run from inside a session, both default: its version and the installed one)",
+              file=sys.stderr)
+        sys.exit(2)
+    if vkey(new) <= vkey(old):
+        print(f"Nothing to update: this runs {old} and {new} is installed.")
+        return
+    try:
+        text = changelog_text(new)
+    except OSError as e:
+        print(f"reg changelog: could not fetch the changelog: {e}", file=sys.stderr)
+        sys.exit(1)
+    parts = re.split(r"^## (\d+\.\d+\.\d+)\s*$", text, flags=re.M)
+    picked = [(v, body.strip()) for v, body in zip(parts[1::2], parts[2::2]) if vkey(old) < vkey(v) <= vkey(new)]
+    lines = [ln for _, body in picked for ln in body.splitlines() if ln.startswith("- ")]
+    kinds = {}
+    for ln in lines:
+        k = re.sub(r"^(\[[^\]]*\]|[A-Za-z-]+:)\s*", "", ln[2:]).split(" ", 1)[0]   # "[VSCode] Fixed ..." counts as Fixed
+        k = k if k in ("Added", "Fixed", "Changed", "Improved", "Removed", "Deprecated") else "other"
+        kinds[k] = kinds.get(k, 0) + 1
+    print(f"Claude Code {old} -> {new}: {len(picked)} release{'s' if len(picked) != 1 else ''}, {len(lines)} entries ("
+          + ", ".join(f"{n} {k}" for k, n in sorted(kinds.items(), key=lambda kv: -kv[1])) + ")")
+    out = []
+    for v, body in picked:
+        out += ["", f"## {v}", body]
+    limit = None if "--all" in args else 150
+    out = "\n".join(out).splitlines()
+    print("\n".join(out[:limit]))
+    if limit and len(out) > limit:
+        print(f"\n... {len(out) - limit} more lines: reg changelog {old} {new} --all")
+
+
+# --- restarting ---------------------------------------------------------------------------------------------
+# Design: the "Restarting onto a new Claude Code version" section of the Session Registry Design doc.
+# A request lives in STATE/restart/<id>.json with state scheduled -> fired -> resumed (or cancelled, expired,
+# gone). `reg restart` writes it and leaves a detached `reg _fire <id>` behind, which waits for the time and
+# for the session to be idle, then ends the process. The supervisor (`reg run`) sees the request and resumes
+# the conversation with the re-arm list as its first prompt.
+
+RESTARTS = os.path.join(STATE, "restart")
+# A session file's status: busy, idle, waiting, or shell = idle with background tasks (monitors, shells) still
+# running. A session that keeps monitors is never plain "idle" (the ops session, 2026-10-20).
+IDLE = ("idle", "shell")
+QUICK = 60            # a claude that exits non-zero within this many seconds counts as a crash
+ACTIVE = 120          # a subagent or workflow transcript written this recently counts as running
+
+
+def log_restart(sid: str, **event) -> None:
+    os.makedirs(RESTARTS, exist_ok=True)
+    with open(os.path.join(RESTARTS, f"{sid}.log"), "a") as f:
+        f.write(json.dumps(dict(at=datetime.datetime.now().isoformat(timespec="seconds"), **event)) + "\n")
+
+
+def request_path(sid: str) -> str:
+    return os.path.join(RESTARTS, f"{sid}.json")
+
+
+def ppid(pid: int) -> int:
+    try:
+        return int(read(f"/proc/{pid}/stat").rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def children(pid: int) -> list:
+    out = []
+    for d in glob.glob("/proc/[0-9]*"):
+        try:
+            if ppid(int(d[6:])) == pid:
+                out.append(int(d[6:]))
+        except ValueError:
+            pass
+    return out
+
+
+def background_tasks(claude_pid: int) -> list:
+    """The session's Bash tool and Monitor commands still running, other than the one asking."""
+    mine, p = set(), os.getpid()
+    while p > 1:
+        mine.add(p)
+        p = ppid(p)
+    out = []
+    for c in children(claude_pid):
+        if c in mine:
+            continue
+        cmd = " ".join(argv(c))
+        m = re.search(r"eval '(.*?)' < /dev/null", cmd, re.S) if "shell-snapshots" in cmd else None
+        if m:
+            out.append(m.group(1).replace("\n", " ")[:90])
+    return out
+
+
+def conv_dir(cwd: str, sid: str) -> str:
+    return os.path.join(HOME, ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd), sid)
+
+
+def active_subagents(cwd: str, sid: str) -> list:
+    now, out = time.time(), []
+    for f in glob.glob(os.path.join(conv_dir(cwd, sid), "subagents", "*.jsonl")) + \
+             glob.glob(os.path.join(conv_dir(cwd, sid), "workflows", "**", "*.jsonl"), recursive=True):
+        try:
+            if now - os.path.getmtime(f) < ACTIVE:
+                out.append(os.path.basename(f))
+        except OSError:
+            pass
+    return out
+
+
+def supervisor(claude_pid: int, sid: str) -> str:
+    """What restarts this session when its claude exits: 'reg run', 'loop' (a script that resumes it, without
+    passing a first prompt) or ''."""
+    cmd = " ".join(argv(ppid(claude_pid)))
+    if re.search(r"\breg run\b", cmd) and sid in cmd:
+        return "reg run"
+    if "agent-session" in cmd or "tutor-session" in cmd:
+        return "loop"
+    return ""
+
+
+def zellij_pane(pid: int) -> tuple:
+    """(Zellij session, pane id) the process runs in, from its environment, or ("", "")."""
+    try:
+        env = dict(kv.split(b"=", 1) for kv in read(f"/proc/{pid}/environ", True).split(b"\0") if b"=" in kv)
+    except OSError:
+        return "", ""
+    return env.get(b"ZELLIJ_SESSION_NAME", b"").decode(), env.get(b"ZELLIJ_PANE_ID", b"").decode()
+
+
+def zellij_server(pid: int) -> int:
+    while pid > 1:
+        try:
+            if read(f"/proc/{pid}/comm").strip().startswith("zellij"):
+                return pid
+        except OSError:
+            return 0
+        pid = ppid(pid)
+    return 0
+
+
+def pane_shell(server: int, session: str, pane: str) -> int:
+    """The shell now running as that pane's own process (a child of the Zellij server), or 0."""
+    for c in children(server):
+        try:
+            if read(f"/proc/{c}/comm").strip() not in ("bash", "zsh", "fish", "sh"):
+                continue
+            env = dict(kv.split(b"=", 1) for kv in read(f"/proc/{c}/environ", True).split(b"\0") if b"=" in kv)
+        except OSError:
+            continue
+        if env.get(b"ZELLIJ_SESSION_NAME", b"").decode() == session and env.get(b"ZELLIJ_PANE_ID", b"").decode() == pane:
+            return c
+    return 0
+
+
+def zellij(session: str, *args, socket_dir: str = "") -> str:
+    # not this pane's own variables, but ZELLIJ_SOCKET_DIR stays: the tutor's sessions live where it points
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ZELLIJ") or k == "ZELLIJ_SOCKET_DIR"}
+    if socket_dir:
+        env["ZELLIJ_SOCKET_DIR"] = socket_dir
+    try:
+        return subprocess.run(["zellij", "-s", session, "action", *args], env=env, capture_output=True,
+                              text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def adopt(req: dict) -> None:
+    """Start the supervisor in the Zellij pane the old claude ran in. A pane whose own command was claude is now
+    held by Zellij ("<ENTER> run, <ESC> drop to shell", drawn in the frame, not the screen): Esc gives a shell
+    there, while Enter would run the old command again. A pane that ran claude from a shell is back at it."""
+    a = req["adopt"]
+    session, pane, server = a["zellij"], a["pane"], a.get("server", 0)
+    if a.get("direct"):
+        time.sleep(3)
+        zellij(session, "write", "-p", pane, "27")
+    for _ in range(20):
+        if pane_shell(server, session, pane):
+            break
+        time.sleep(1)
+    else:
+        log_restart(req["id"], event="adopt failed", note=f"no shell appeared in Zellij {session} pane {pane}; "
+                    "nothing typed. Resume it by hand: reg run --id " + req["id"])
+        return
+    time.sleep(2)                                  # the shell reads its rc files; typed input waits for it anyway
+    cmd = (f"cd {shlex.quote(req['cwd'])} && reg run --id {req['id']}"
+           + (f" --name {shlex.quote(req['name'])}" if req.get("name") else "")
+           + " -- " + " ".join(shlex.quote(f) for f in req.get("flags") or []))
+    zellij(session, "write-chars", "-p", pane, cmd)
+    zellij(session, "write", "-p", pane, "13")
+    log_restart(req["id"], event="adopted", zellij=session, pane=pane, command=cmd)
+
+
+def rearm_file(sid: str) -> str:
+    return os.path.join(HOME, ".claude", "jobs", sid[:8], "rearm.json")
+
+
+def first_prompt(req: dict) -> str:
+    """The message a restarted session starts with: what happened, and its own re-arm list."""
+    at = datetime.datetime.now().strftime("%H:%M")
+    lines = [f"[reg restart] You were restarted at {at} onto Claude Code {req.get('to_version') or 'the installed version'}"
+             f" (you ran {req.get('from_version', '?')}). Your reason: {req.get('reason', '-')}.",
+             "A restart ends everything the old process ran: session crons, Monitors, background shell tasks and "
+             "subagents are gone. MCP servers are started again by Claude Code."]
+    path = rearm_file(req["id"])
+    plan = load_json(path, None)
+    if isinstance(plan, dict):
+        lines.append(f"Re-arm from {path}. Run CronList first and create only the crons that are missing "
+                     f"({len(plan.get('crons') or [])} listed, with their full prompts in the file), arm the "
+                     f"{len(plan.get('monitors') or [])} monitors, then do these steps in order:")
+        lines += [f"{i}. {step}" for i, step in enumerate(plan.get("after_restart") or [], 1)]
+    else:
+        lines.append(f"You left no re-arm file ({path}). Bring back whatever crons, monitors and background jobs "
+                     "you ran from your own notes, and run CronList before creating any cron.")
+    lines.append("When everything is back, post one line to Erik: back on which version, and what you re-armed.")
+    return "\n".join(lines)
+
+
+def cmd_run(args: list) -> None:
+    """Supervisor: runs claude for one pinned conversation and keeps it going through requested restarts."""
+    extra = args[args.index("--") + 1:] if "--" in args else []
+    opts = args[:args.index("--")] if "--" in args else args
+    sid = opts[opts.index("--id") + 1] if "--id" in opts else ""
+    name = opts[opts.index("--name") + 1] if "--name" in opts else ""
+    keep = "--keep" in opts
+    if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", sid):
+        print("usage: reg run --id UUID [--name NAME] [--keep] [-- claude flags]", file=sys.stderr)
+        sys.exit(2)
+    cwd = os.getcwd()
+    child = {"proc": None, "stop": False}
+
+    def stop(signum, _frame):                  # the pane closes or the service stops: end claude, do not loop
+        child["stop"] = True
+        if child["proc"] and child["proc"].poll() is None:
+            child["proc"].send_signal(signum)
+    for s_ in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s_, stop)
+
+    def restore():                             # claude gets Ctrl+C and Ctrl+\ back; this process ignores them
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+
+    crashes, binary = 0, ""
+    while not child["stop"]:
+        req = load_json(request_path(sid), {})
+        prompt = ""
+        if req.get("state") == "fired":
+            prompt = first_prompt(req)
+            req.update(state="resumed", resumed_at=time.time())
+            write_json(request_path(sid), req)
+        # The stable install path, not PATH: under fnm, PATH points into a per-shell directory that fnm may delete.
+        exe = binary or next((b for b in CLAUDE_BINS if os.path.exists(b)), "") or shutil.which("claude") or "claude"
+        conv = os.path.isfile(os.path.join(HOME, ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd), f"{sid}.jsonl"))
+        cmd = [exe] + (["--resume", sid] if conv else ["--session-id", sid])
+        if name:
+            cmd += ["--name", name, "--remote-control", name]
+        cmd += extra + ([prompt] if prompt else [])
+        log_restart(sid, event="start", exe=exe, resume=conv, prompt=bool(prompt), pid=os.getpid())
+        start = time.time()
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGQUIT, signal.SIG_IGN)
+        try:
+            child["proc"] = subprocess.Popen(cmd, preexec_fn=restore)
+            rc = child["proc"].wait()
+        except OSError as e:
+            print(f"reg run: cannot start {exe}: {e}", file=sys.stderr)
+            rc = 127
+        took = time.time() - start
+        log_restart(sid, event="exit", rc=rc, seconds=round(took))
+        if child["stop"]:
+            break
+        req = load_json(request_path(sid), {})
+        if req.get("state") == "fired":            # reg restart ended it: start again at once, with the re-arm list
+            crashes = 0
+            continue
+        if rc != 0 and took < QUICK:
+            crashes += 1
+            prev = os.path.join(HOME, ".local", "share", "claude", "versions", req.get("from_version", ""))
+            if crashes == 2 and req.get("from_version") and os.path.isfile(prev):
+                binary = prev                      # the new version does not come up: back to the one that ran
+                log_restart(sid, event="fallback", exe=prev)
+                print(f"reg run: claude crashed twice; falling back to {req['from_version']}", file=sys.stderr)
+            if crashes >= 5:
+                log_restart(sid, event="gave up", crashes=crashes)
+                print(f"reg run: claude crashed {crashes} times in a row; giving up. Log: {RESTARTS}/{sid}.log", file=sys.stderr)
+                sys.exit(1)
+            time.sleep(10 * crashes)
+            continue
+        crashes = 0
+        if not keep:                               # Erik quit it: the pane goes back to its shell
+            break
+        time.sleep(15)
+
+
+def parse_when(args: list) -> float:
+    now = time.time()
+    if "--now" in args:
+        return now
+    if "--in" in args:
+        v = args[args.index("--in") + 1]
+        m = re.fullmatch(r"(\d+)\s*([mh]?)", v)
+        if not m:
+            raise ValueError(f"--in takes minutes or hours, e.g. 10m or 1h, not {v!r}")
+        return now + int(m.group(1)) * (3600 if m.group(2) == "h" else 60)
+    if "--at" in args:
+        h, mi = (int(x) for x in args[args.index("--at") + 1].split(":"))
+        t = datetime.datetime.now().replace(hour=h, minute=mi, second=0, microsecond=0)
+        if t.timestamp() <= now:
+            t += datetime.timedelta(days=1)
+        return t.timestamp()
+    raise ValueError("say when: --in 10m, --at 03:30 or --now")
+
+
+JUDGE = """You must judge these yourself; reg cannot see them:
+- No turn, subagent, workflow or Codex review of yours is running: ListAgents shows none.
+- Nothing is being changed on prod or staging (deploy, migration, cutover, a restart window).
+- Not within ten minutes of one of your crons or one-off timers.
+- Nothing from Erik is waiting on you, and he wrote nothing in the last 30 minutes, unless he asked for this.
+- Not inside one of Erik's announced work blocks (the TUM session holds his calendar); else pick 03:00-05:00.
+- Your handoff and re-arm file are current; nothing is half-done.
+- Post one line to Erik first ("restarting onto <version> at HH:MM for <reason>, about 2 minutes") and give him
+  ten minutes to object, unless he asked for the restart."""
+
+
+def cmd_restart(args: list) -> None:
+    own = own_session()
+    sid, pid = own.get("sessionId", ""), int(own.get("pid") or 0)
+    if not sid:
+        print("reg restart: run it from inside the Claude session that should restart (its Bash tool).", file=sys.stderr)
+        sys.exit(2)
+    path = request_path(sid)
+    req = load_json(path, {})
+    if "--cancel" in args:
+        if req.get("state") == "scheduled":
+            req.update(state="cancelled")
+            write_json(path, req)
+            log_restart(sid, event="cancelled")
+            print("Cancelled.")
+        else:
+            print(f"Nothing scheduled ({req.get('state') or 'no request'}).")
+        return
+    if "--status" in args:
+        print(json.dumps(req, indent=1) if req else "No restart requested.")
+        try:
+            print("".join(read(os.path.join(RESTARTS, f"{sid}.log")).splitlines(True)[-8:]))
+        except OSError:
+            pass
+        return
+    cwd, have, new = own.get("cwd", ""), own.get("version", ""), installed_version()
+    sup, tasks, subs = supervisor(pid, sid), background_tasks(pid), active_subagents(own.get("cwd", ""), sid)
+    plan = load_json(rearm_file(sid), None)
+    if "--check" in args or not any(a in args for a in ("--in", "--at", "--now")):
+        print(f"This session: {sid[:8]}, pid {pid}, Claude Code {have}; installed {new or '?'}"
+              + (" (reg changelog shows what changed)" if new and vkey(new) > vkey(have) else " (nothing newer)"))
+        zs, zp = zellij_pane(pid)
+        print("Supervisor:   " + {"reg run": "reg run: it resumes you with your re-arm list as the first prompt",
+                                  "loop": "a loop that resumes you; your re-arm list comes from the start note, not as a prompt",
+                                  "": (f"none yet. This restart moves you under reg run in your Zellij pane ({zs} #{zp}) "
+                                       "and keeps your launch flags" if zs else
+                                       "NONE and not in Zellij: nothing would start you again, so reg restart refuses")}[sup])
+        print(f"Re-arm file:  {rearm_file(sid)}: " + (f"{len(plan.get('crons') or [])} crons, {len(plan.get('monitors') or [])} monitors, "
+              f"{len(plan.get('after_restart') or [])} steps" if isinstance(plan, dict) else "none. If you run crons, monitors or "
+              "background jobs, write one first (format: crons, monitors, after_restart; see the ops session's)"))
+        print(f"Background:   {len(tasks)} shell tasks will end" + "".join(f"\n  - {t}" for t in tasks))
+        print(f"Subagents:    {len(subs)} transcripts written in the last {ACTIVE // 60} min" + "".join(f"\n  - {t}" for t in subs))
+        if req.get("state") == "scheduled":
+            print(f"Scheduled:    {datetime.datetime.fromtimestamp(req['fire_at']).strftime('%H:%M')} ({req.get('reason')})")
+        print("\n" + JUDGE + "\n\nThen: reg restart --in 10m --reason \"...\"   (--cancel withdraws it)")
+        return
+    reason = args[args.index("--reason") + 1] if "--reason" in args else ""
+    if not reason:
+        print("reg restart: give a --reason (it is shown to you after the restart and logged).", file=sys.stderr)
+        sys.exit(2)
+    zs, zp = zellij_pane(pid)
+    if not sup and not zs:
+        print("reg restart: refused: nothing would start this session again (no supervisor, not in a Zellij pane). "
+              "Erik has to start it under `reg run` once.", file=sys.stderr)
+        sys.exit(1)
+    if subs and "--force" not in args:
+        print(f"reg restart: refused: {len(subs)} subagent or workflow transcripts were written in the last "
+              f"{ACTIVE // 60} min ({', '.join(subs[:3])}). They would be lost. Wait, or --force.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        when = parse_when(args)
+    except (ValueError, IndexError) as e:
+        print(f"reg restart: {e}", file=sys.stderr)
+        sys.exit(2)
+    req = {"id": sid, "pid": pid, "proc_start": str(own.get("procStart") or ""), "cwd": cwd, "reason": reason,
+           "from_version": have, "to_version": new, "bridge": own.get("bridgeSessionId") or "",
+           "requested_at": time.time(), "fire_at": when, "state": "scheduled", "force": "--force" in args,
+           "flags": flags(argv(pid)), "name": own.get("name", "") if own.get("nameSource") == "user" else ""}
+    if not sup:
+        server = zellij_server(pid)
+        req["adopt"] = {"zellij": zs, "pane": zp, "server": server, "direct": ppid(pid) == server}
+    write_json(path, req)
+    log_restart(sid, event="scheduled", fire_at=when, reason=reason, from_version=have, to_version=new)
+    with open(os.path.join(RESTARTS, f"{sid}.fire.log"), "a") as out:
+        subprocess.Popen([sys.executable, os.path.realpath(__file__), "_fire", sid], stdin=subprocess.DEVNULL,
+                         stdout=out, stderr=out, start_new_session=True, close_fds=True)
+    print(f"Restart scheduled for {datetime.datetime.fromtimestamp(when).strftime('%H:%M')}, once you are idle. "
+          f"Finish your turn; `reg restart --cancel` withdraws it. You come back with your re-arm list as the first message.")
+
+
+def cmd_fire(sid: str) -> None:
+    """Detached: waits for the time and for the session to be idle, then ends its claude."""
+    path = request_path(sid)
+    deadline = None
+    while True:
+        req = load_json(path, {})
+        if req.get("state") != "scheduled":
+            return                                 # cancelled, or another request took over
+        now = time.time()
+        if now >= req["fire_at"]:
+            deadline = deadline or now + 3600
+            pid = int(req["pid"])
+            try:
+                alive = proc_start(pid) == req["proc_start"]
+            except (OSError, ValueError, IndexError):
+                alive = False
+            if not alive:
+                req.update(state="gone")
+                write_json(path, req)
+                log_restart(sid, event="gone", note="the process that asked has ended already")
+                return
+            status = (load_json(os.path.join(SESSIONS, f"{pid}.json"), {}) or {}).get("status")
+            subs = [] if req.get("force") else active_subagents(req["cwd"], sid)
+            if status in IDLE and not subs:
+                break
+            if now > deadline:
+                req.update(state="expired")
+                write_json(path, req)
+                log_restart(sid, event="expired", note=f"not idle within an hour (status {status}, {len(subs)} subagents)")
+                return
+        time.sleep(10)
+    req.update(state="fired", fired_at=time.time())
+    write_json(path, req)
+    log_restart(sid, event="fired", pid=pid)
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(30):
+        time.sleep(1)
+        try:
+            if proc_start(pid) != req["proc_start"]:
+                break
+        except (OSError, ValueError, IndexError):
+            break
+    else:
+        os.kill(pid, signal.SIGKILL)
+        log_restart(sid, event="killed", note="did not end within 30 s of SIGTERM")
+    if req.get("adopt"):
+        adopt(req)
+    for i in range(48):                            # did it come back? the same conversation under a new pid, and
+        time.sleep(5)                              # Remote Control connected again when it was before
+        for f in glob.glob(os.path.join(SESSIONS, "*.json")):
+            d = load_json(f, {})
+            if isinstance(d, dict) and d.get("sessionId") == sid and int(d.get("pid") or 0) != pid:
+                if req.get("bridge") and not d.get("bridgeSessionId") and i < 47:
+                    break
+                log_restart(sid, event="back", pid=d.get("pid"), version=d.get("version"),
+                            bridge_before=req.get("bridge"), bridge_after=d.get("bridgeSessionId"))
+                return
+    log_restart(sid, event="not back", note="no session file for this conversation 4 min after the restart")
+
+
+# --- compacting --------------------------------------------------------------------------------------------
+# Only typed input can run /compact; a session has no tool for it, and hooks can only block a compaction. So
+# `reg compact` types `/compact <the session's own instructions>` into the session's terminal pane once it is
+# idle, waits until the compaction is in the transcript, then types a prompt that tells it to carry on.
+# Tested 2026-10-19 on a throwaway session: typed /compact runs like Erik's; a burst over ~1,000 characters
+# turns into "[Pasted text #1]" and goes out as a plain prompt, so text goes in CHUNK-sized pieces (2,138
+# characters arrived whole that way).
+# What reg types arrives as user input, the channel Erik's approvals come through. So both texts say they are
+# automation, the follow-up says it approves nothing, and nothing is typed while the session's last message ends
+# in a question to Erik: a session is often idle because it is waiting for his yes (ops, 2026-10-19).
+COMPACTS = os.path.join(STATE, "compact")
+CHUNK = 400
+TAG = "[reg compact: automated, NOT Erik]"
+ASKING = re.compile(r"your go\b|shall i\b|waiting (on|for) (you|your|erik)\b|say the word|your call\b|your (yes|approval)\b",
+                    re.I)
+# Additive, never "drop X": ctx_keeper's audit (shared/compaction-audit.log) measured the instructed compactions of
+# 2026-10-19/20 keeping 57% and 61% of Erik's clauses in 20k and 11k characters, the automatic ones 68-79% in
+# 19-27k. Restrictive instructions shorten the summary; what carries a session across is its handoff file.
+DEFAULT_INSTRUCTIONS = ("In addition to your usual summary, and without shortening it: keep word for word Erik's open "
+                        "requests in his words, every ID, path, number and command still in flight, decisions waiting "
+                        "on Erik, and rules he set. If this session keeps a handoff or notes file, give its path.")
+HANDOFFS = os.path.join(HOME, ".claude", "memory", "shared", "handoffs")   # ctx_keeper's, one per session: <id8>.md
+HANDOFF_FRESH = 900
+
+
+def log_compact(sid: str, **event) -> None:
+    os.makedirs(COMPACTS, exist_ok=True)
+    with open(os.path.join(COMPACTS, f"{sid}.log"), "a") as f:
+        f.write(json.dumps(dict(at=datetime.datetime.now().isoformat(timespec="seconds"), **event)) + "\n")
+
+
+def pane_of(pid: int) -> dict:
+    """The terminal pane a claude process draws in: Zellij (session, pane) or tmux (socket, pane), or {}. Read
+    from its environment, else from its parents' (a claude started through `env -i` has none of its own)."""
+    for _ in range(6):
+        try:
+            env = dict(kv.split(b"=", 1) for kv in read(f"/proc/{pid}/environ", True).split(b"\0") if b"=" in kv)
+            comm = read(f"/proc/{pid}/comm").strip()
+        except OSError:
+            return {}
+        g = lambda k: env.get(k, b"").decode(errors="replace")
+        if g(b"ZELLIJ_SESSION_NAME") and g(b"ZELLIJ_PANE_ID"):
+            # where the session's socket is, from its server's command line (zellij --server <dir>/<contract>/<name>):
+            # the asking process may lack the XDG_RUNTIME_DIR or ZELLIJ_SOCKET_DIR that put it there
+            srv = zellij_server(pid)
+            server = argv(srv) if srv else []
+            sock = server[server.index("--server") + 1] if "--server" in server[:-1] else ""
+            return {"kind": "zellij", "session": g(b"ZELLIJ_SESSION_NAME"), "pane": g(b"ZELLIJ_PANE_ID"),
+                    "socket_dir": os.path.dirname(os.path.dirname(sock)) if sock else ""}
+        if g(b"TMUX") and g(b"TMUX_PANE"):
+            return {"kind": "tmux", "socket": os.path.basename(g(b"TMUX").split(",")[0]), "pane": g(b"TMUX_PANE")}
+        if comm.startswith(("zellij", "tmux")):
+            return {}
+        pid = ppid(pid)
+        if pid <= 1:
+            return {}
+    return {}
+
+
+def tmux(socket: str, *args) -> str:
+    try:
+        return subprocess.run(["tmux", "-L", socket, *args], capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def pane_screen(p: dict) -> str:
+    """The pane's visible screen with its styling (SGR codes), which input_empty needs."""
+    if p["kind"] == "zellij":
+        return zellij(p["session"], "dump-screen", "-a", "-p", p["pane"], socket_dir=p.get("socket_dir", ""))
+    return tmux(p["socket"], "capture-pane", "-e", "-p", "-t", p["pane"])
+
+
+def ticket(sid: str, text: str) -> None:
+    """A one-use ticket for this exact text, written before typing it. ctx_keeper's prompt guard (memory
+    bin/ctx_keeper.py) matches the submitted prompt against it and tells the session, as hook context rather than
+    user text, that the turn is automation and approves nothing; a tagged prompt without a ticket is flagged."""
+    os.makedirs(COMPACTS, exist_ok=True)
+    with open(os.path.join(COMPACTS, f"{sid}.tickets"), "a") as f:
+        f.write(json.dumps({"sha256": hashlib.sha256(text.strip().encode()).hexdigest(), "exp": time.time() + 1800}) + "\n")
+
+
+def pane_type(p: dict, text: str) -> None:
+    """Types text, then Enter, in pieces small enough not to be taken for a paste."""
+    for i in range(0, len(text), CHUNK):
+        if p["kind"] == "zellij":
+            zellij(p["session"], "write-chars", "-p", p["pane"], text[i:i + CHUNK], socket_dir=p.get("socket_dir", ""))
+        else:
+            tmux(p["socket"], "send-keys", "-t", p["pane"], "-l", text[i:i + CHUNK])
+        time.sleep(0.15)
+    time.sleep(0.5)
+    if p["kind"] == "zellij":
+        zellij(p["session"], "write", "-p", p["pane"], "13", socket_dir=p.get("socket_dir", ""))
+    else:
+        tmux(p["socket"], "send-keys", "-t", p["pane"], "Enter")
+
+
+SGR = re.compile(r"\x1b\[([0-9;]*)m")
+
+
+def input_empty(screen: str) -> bool:
+    """Whether Claude's input box holds nothing typed. The box is the text between the last two rules. Empty, it
+    shows the prompt sign alone or dim text: the 'Try "..."' placeholder, or a suggested next prompt after a turn
+    (seen 2026-10-19: "❯ reg compact --status"). Typed text is not dim."""
+    lines = screen.rstrip("\n").split("\n")
+    plain = [SGR.sub("", line) for line in lines]
+    rules = [i for i, line in enumerate(plain) if line.lstrip().startswith("──")]
+    if len(rules) < 2:
+        return False                               # no input box on screen: a dialog or a menu, so not now
+    for raw, text in zip(lines[rules[-2] + 1:rules[-1]], plain[rules[-2] + 1:rules[-1]]):
+        if not text.strip().lstrip("❯>").strip():
+            continue
+        lead = re.match(r"(?:\x1b\[[0-9;]*m|\s|❯|>)*", raw).group(0)
+        dim = False                                # the styling in force where the line's text starts
+        for codes in SGR.findall(lead):
+            for c in (codes or "0").split(";"):
+                if c == "2":
+                    dim = True
+                elif c in ("0", "22"):
+                    dim = False
+        if not dim:
+            return False
+    return True
+
+
+def transcript(sid: str) -> str:
+    hits = glob.glob(os.path.join(HOME, ".claude", "projects", "*", f"{sid}.jsonl"))
+    return hits[0] if hits else ""
+
+
+def asks_erik(path: str) -> str:
+    """The question the session's last message puts to Erik, if it ends in one: its last paragraph has a
+    question mark, or the message asks for his go in so many words. '' when it does not."""
+    text = ""
+    try:
+        with open(path, "rb") as f:
+            for raw in f:
+                if b'"assistant"' not in raw:
+                    continue
+                try:
+                    o = json.loads(raw)
+                except ValueError:
+                    continue
+                if o.get("type") != "assistant":
+                    continue
+                parts = [c.get("text", "") for c in (o.get("message") or {}).get("content") or []
+                         if isinstance(c, dict) and c.get("type") == "text"]
+                if any(t.strip() for t in parts):
+                    text = "\n".join(parts)
+    except OSError:
+        return ""
+    paras = [x.strip() for x in re.split(r"\n\s*\n", text) if x.strip()]
+    last = paras[-1] if paras else ""
+    if "?" in last:
+        return " ".join(last.split())[-160:]
+    m = ASKING.search(last)                        # the last paragraph only: earlier ones may quote such words
+    return f"...{m.group(0)}..." if m else ""      # ("I won't take a typed continue as your approval")
+
+
+def compactions(path: str) -> int:
+    try:
+        with open(path, "rb") as f:
+            return sum(1 for line in f if b'"compact_boundary"' in line)
+    except OSError:
+        return 0
+
+
+COMPACT_FLAGS = {"--text", "--file", "--then", "--force", "--cancel", "--status"}
+
+
+def cmd_compact(args: list) -> None:
+    takes = {"--text", "--file", "--then"}
+    unknown = [a for i, a in enumerate(args) if a.startswith("-") and a not in COMPACT_FLAGS
+               and not (i and args[i - 1] in takes)]
+    if unknown:                                    # an unknown flag must never schedule anything (ops ran --help)
+        print(f"reg compact: unknown option {unknown[0]}. Usage:\n" + usage("reg compact"), file=sys.stderr)
+        sys.exit(2)
+    own = own_session()
+    sid, pid = own.get("sessionId", ""), int(own.get("pid") or 0)
+    if not sid:
+        print("reg compact: run it from inside the Claude session that should compact (its Bash tool).", file=sys.stderr)
+        sys.exit(2)
+    path = os.path.join(COMPACTS, f"{sid}.json")
+    req = load_json(path, {})
+    if "--cancel" in args:
+        if req.get("state") == "scheduled":
+            req.update(state="cancelled")
+            write_json(path, req)
+            log_compact(sid, event="cancelled")
+            print("Cancelled.")
+        else:
+            print(f"Nothing scheduled ({req.get('state') or 'no request'}).")
+        return
+    if "--status" in args:
+        print(json.dumps(req, indent=1) if req else "No compaction requested.")
+        try:
+            print("".join(read(os.path.join(COMPACTS, f"{sid}.log")).splitlines(True)[-8:]))
+        except OSError:
+            pass
+        return
+    if "--file" in args:
+        text = read(os.path.expanduser(args[args.index("--file") + 1]))
+    elif "--text" in args:
+        text = args[args.index("--text") + 1]
+    else:
+        text = DEFAULT_INSTRUCTIONS
+    text = " ".join(text.split())                  # one line: a newline would send it half-typed
+    then = " ".join((args[args.index("--then") + 1] if "--then" in args else "").split())
+    p = pane_of(pid)
+    if not p:
+        print("reg compact: refused: this session has no Zellij or tmux pane to type into. Only Erik can /compact it.",
+              file=sys.stderr)
+        sys.exit(1)
+    if not 0 < len(text) <= 6000:
+        print(f"reg compact: instructions must be 1 to 6,000 characters (these are {len(text):,}).", file=sys.stderr)
+        sys.exit(2)
+    asking = asks_erik(transcript(sid))
+    handoff = os.path.join(HANDOFFS, f"{sid[:8]}.md")
+    try:
+        handoff_age = time.time() - os.path.getmtime(handoff)
+    except OSError:
+        handoff, handoff_age = "", 0
+    subs = active_subagents(own.get("cwd", ""), sid)
+    if subs and "--force" not in args:
+        print(f"reg compact: refused: {len(subs)} subagent or workflow transcripts were written in the last "
+              f"{ACTIVE // 60} min. Compact after they finish, or --force.", file=sys.stderr)
+        sys.exit(1)
+    req = {"id": sid, "pid": pid, "proc_start": str(own.get("procStart") or ""), "cwd": own.get("cwd", ""),
+           "pane": p, "text": text, "then": then, "requested_at": time.time(), "state": "scheduled",
+           "force": "--force" in args, "handoff": handoff}
+    write_json(path, req)
+    log_compact(sid, event="scheduled", pane=p, chars=len(text))
+    with open(os.path.join(COMPACTS, f"{sid}.fire.log"), "a") as out:
+        subprocess.Popen([sys.executable, os.path.realpath(__file__), "_compact", sid], stdin=subprocess.DEVNULL,
+                         stdout=out, stderr=out, start_new_session=True, close_fds=True)
+    where = f"Zellij {p['session']} pane {p['pane']}" if p["kind"] == "zellij" else f"tmux -L {p['socket']} pane {p['pane']}"
+    print(f"Compaction scheduled. When you are idle and the input box is empty, reg types `/compact` with your "
+          f"{len(text):,}-character instructions into your pane ({where}); after it, a prompt tells you to carry on. "
+          f"Both start with {TAG}: they are never Erik's word. Nothing is typed while your last message ends in a "
+          f"question to Erik. End your turn now. `reg compact --cancel` withdraws it; `--status` shows its log.")
+    if asking:
+        print(f"Note: your last message asks Erik something ({asking}). The compaction waits until he has answered.")
+    if handoff and handoff_age > HANDOFF_FRESH:
+        print(f"Your handoff {handoff} is {handoff_age / 60:.0f} min old. It is what carries you across the compaction, "
+              f"better than any summary: bring it up to date before you end this turn.")
+
+
+def wait_idle(req: dict, path: str, until: float, question: bool = False) -> str:
+    """'' once the session is idle (twice, 5 s apart), its subagents done and its input box empty, and with
+    question=True its last message not asking Erik anything; else why not."""
+    sid, pid, calm, said = req["id"], int(req["pid"]), 0, ""
+    while time.time() < until:
+        if load_json(path, {}).get("state") not in ("scheduled", "compacted"):
+            return "cancelled"
+        try:
+            if proc_start(pid) != req["proc_start"]:
+                return "gone"
+        except (OSError, ValueError, IndexError):
+            return "gone"
+        status = (load_json(os.path.join(SESSIONS, f"{pid}.json"), {}) or {}).get("status")
+        subs = [] if req.get("force") else active_subagents(req["cwd"], sid)
+        calm = calm + 1 if status in IDLE and not subs else 0
+        if calm >= 2:
+            asking = asks_erik(transcript(sid)) if question else ""
+            if asking:
+                if said != "asking":
+                    log_compact(sid, event="waiting on operator", question=asking,
+                                note="the last message asks Erik something; nothing is typed until he has answered")
+                said = "asking"
+            elif input_empty(pane_screen(req["pane"])):
+                return ""
+            elif said != "draft":
+                said = "draft"
+                log_compact(sid, event="waiting", note="something is typed in the input box; not typing over it")
+            calm = 0
+        time.sleep(5)
+    return "skipped: waiting on operator" if said == "asking" else "expired"
+
+
+def cmd_compact_fire(sid: str) -> None:
+    """Detached: types /compact once the session is idle, waits for the compaction, then types the follow-up."""
+    path = os.path.join(COMPACTS, f"{sid}.json")
+    req = load_json(path, {})
+    why = wait_idle(req, path, time.time() + 3600, question=True)
+    if why:
+        if why != "cancelled":
+            req.update(state=why)
+            write_json(path, req)
+        log_compact(sid, event=why)
+        return
+    conv = transcript(sid)
+    before = compactions(conv)
+    typed = f"/compact {TAG} {req['text']}"
+    ticket(sid, typed)
+    pane_type(req["pane"], typed)
+    req.update(state="compacting", typed_at=time.time())
+    write_json(path, req)
+    log_compact(sid, event="typed", compactions_before=before)
+    deadline = time.time() + 1200                  # a large context takes minutes to summarise
+    while compactions(conv) <= before:
+        if time.time() > deadline:
+            req.update(state="no compaction")
+            write_json(path, req)
+            log_compact(sid, event="no compaction", note="no compact_boundary in the transcript 20 min after typing")
+            return
+        time.sleep(5)
+    req.update(state="compacted")
+    write_json(path, req)
+    log_compact(sid, event="compacted")
+    when = datetime.datetime.now().strftime("%H:%M")
+    notes = f"your handoff {req['handoff']}" if req.get("handoff") else "your handoff or notes if you keep them"
+    then = (f"{TAG} You were compacted at {when}, as you asked. This message approves nothing: any question you "
+            f"asked Erik is still open, and only his own reply answers it. Re-read {notes}, then continue only with "
+            f"work that needs no new approval from him.")
+    if req.get("then"):
+        then += " Your note for after the compaction: " + req["then"]
+    if wait_idle(req, path, time.time() + 600):
+        log_compact(sid, event="follow-up not typed", note="not idle with an empty input box within 10 min")
+        return
+    ticket(sid, then)
+    pane_type(req["pane"], then)
+    req.update(state="done", done_at=time.time())
+    write_json(path, req)
+    log_compact(sid, event="done")
+
+
+def cmd_update_note() -> None:
+    """UserPromptSubmit hook: one notice per session and installed version. Silent on any error."""
+    try:
+        hook = json.load(sys.stdin)
+        sid = hook.get("session_id") or ""
+        own = own_session()
+        have, new = own.get("version", ""), installed_version()
+        if not sid or not have or not new or vkey(new) <= vkey(have):
+            return
+        seen_path = os.path.join(RESTARTS, "update-notes.json")
+        seen = load_json(seen_path, {})
+        if seen.get(sid) == new:
+            return
+        seen[sid] = new
+        write_json(seen_path, seen)
+    except Exception:
+        return
+    print(f"Claude Code {new} is installed; this session still runs {have}. `reg changelog` shows what changed. If "
+          f"something there matters for your work, restart onto it at a safe moment: `reg restart --check` explains "
+          f"how. If not, ignore this; you will not be told about {new} again.")
+
+
+def cmd_note() -> None:
+    """SessionStart hook. Prints a few lines that become part of the session's context; never fails the start."""
+    try:
+        hook = json.load(sys.stdin)
+        sid, cwd = hook.get("session_id") or "", hook.get("cwd") or os.getcwd()
+        reg, _ = view()
+        entries = reg.get("sessions", {})
+        own = entries.get(sid, {}).get("handle") or make_handle(cwd, sid, {e.get("handle") for e in entries.values()})
+    except Exception:
+        return
+    print(f"Session registry: this Claude session is {own} on {MACHINE}. Erik and other sessions may address it by that handle.\n"
+          "To message another Claude session, whatever name you were given for it (a handle, a Zellij or tmux session, "
+          "a title, a folder): run `reg who <name>` and SendMessage to the address it prints. ListAgents shows the same "
+          "session under different names on each machine, and those names change on restart, so never pick a recipient "
+          "by guessing from them. `reg list` shows every session. A message is delivered only when sender and receiver "
+          "run in the same permission mode; otherwise the receiver holds it.")
+
+
+def usage(prefix: str) -> str:
+    """The docstring's lines for one command."""
+    out, on = [], False
+    for line in __doc__.split("\n\n")[1].splitlines():
+        if line.startswith("  reg "):
+            on = line.startswith("  " + prefix)
+        if on:
+            out.append(line)
+    return "\n".join(out) or __doc__.split("\n\n")[1]
+
+
+def main() -> None:
+    cmd, args = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("list", [])
+    mine = args[:args.index("--")] if "--" in args else args      # after --: flags for claude, not for reg
+    if cmd in ("-h", "--help", "help") or "-h" in mine or "--help" in mine:
+        print(usage(f"reg {cmd}") if cmd not in ("-h", "--help", "help") else __doc__.split("\n\n")[1])
+        return
+    if cmd == "collect":
+        cmd_collect(args)
+    elif cmd == "list":
+        cmd_list(args)
+    elif cmd == "who":
+        cmd_who(args)
+    elif cmd == "note":
+        cmd_note()
+    elif cmd == "changelog":
+        cmd_changelog(args)
+    elif cmd == "update-note":
+        cmd_update_note()
+    elif cmd == "side-notes":
+        cmd_side_notes_hook() if "--hook" in args else cmd_side_notes(args)
+    elif cmd == "run":
+        cmd_run(args)
+    elif cmd == "restart":
+        cmd_restart(args)
+    elif cmd == "_fire":
+        cmd_fire(args[0])
+    elif cmd == "compact":
+        cmd_compact(args)
+    elif cmd == "_compact":
+        cmd_compact_fire(args[0])
+    else:
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
