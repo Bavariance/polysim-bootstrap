@@ -1,0 +1,42 @@
+[Unit]
+Description=Claude session in Zellij session %i, resumed under reg run at boot
+Documentation=https://claude.ai/code/artifact/a828a4fa-5c67-4630-9e48-732fbd84649d
+After=network-online.target
+Wants=network-online.target
+
+# A Claude session that must come back by itself after a reboot (on globus, where lingering starts user units at
+# boot). It makes a fresh Zellij session %i from the agent-session layout, whose agent pane runs $AGENT_CMD: here
+# `reg run --id <conversation> --boot`, which resumes the conversation, tells it it was started again and what to
+# re-arm, and starts it again after a crash. Modeled on tum-tutor.service (TUM repo), which runs this way since
+# 2026-10-19.
+#
+# ~/.config/reg-agent/%i.env holds what differs per session:
+#   AGENT_DIR=/home/vespucci/projects/polysimulator      the folder the conversation belongs to
+#   AGENT_ID=e4820566-16a4-40b4-9075-ca9455d397c5         its conversation id
+#   AGENT_FLAGS=--dangerously-skip-permissions            claude flags after reg run's --
+#   ZELLIJ_SOCKET_DIR=/tmp/zellij-1001                    globus only: ssh shells there have no XDG_RUNTIME_DIR and
+#                                                         look under /tmp/zellij-<uid>; without it the session would
+#                                                         sit under /run/user/<uid>, out of their sight
+# Enable for the next boot:  systemctl --user enable reg-agent@<session>.service
+#
+# When the Zellij session already runs (made by hand, before this unit existed) the unit only waits on it, and
+# makes a fresh one once it ends. There is deliberately no ExecStop: systemd runs ExecStop also when the main
+# process ends on its own, and `zellij kill-session` there would kill a session this unit never started (a failed
+# `attach -b` on a running session exits 1, then ExecStop ran: found 2026-10-21). Stopping the unit kills its own
+# cgroup instead, which holds the Zellij server only when this unit started it. Stop or disable the unit before
+# you end the session on purpose, or it is made again 30 s later.
+# ExecStartPre deletes the dead session a reboot leaves behind, so the layout starts fresh instead of being
+# resurrected with every saved command pane started at once.
+[Service]
+Type=simple
+# A Zellij session created by systemd has no TERM, and Claude Code then draws in black and white.
+Environment=TERM=xterm-256color COLORTERM=truecolor
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/reg-agent/%i.env
+ExecStartPre=-/bin/sh -c 'zellij delete-session %i'
+ExecStart=/bin/sh -c 'cd "$AGENT_DIR" || exit 1; pid=$(pgrep -n -f "zellij --server .*/%i$"); if [ -z "$pid" ]; then export AGENT_CMD="reg run --id $AGENT_ID --boot -- $AGENT_FLAGS"; zellij attach %i -b options --default-layout agent-session || exit 1; pid=$(pgrep -n -f "zellij --server .*/%i$") || exit 1; fi; exec tail --pid="$pid" -f /dev/null'
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
