@@ -325,6 +325,7 @@ def snapshot() -> list:
             "flags": flags(args), "launch_name": launch_name(args), "branch": branch(cwd),
             "title": title(cwd, d["sessionId"]),
             "config_dir": os.path.dirname(os.path.dirname(path)),   # ~/.claude or ~/.claude-max5: the account
+            "headless": any(a in ("-p", "--print") for a in args),    # claude -p jobs (Max queue, reviews): not a pane
         })
     box, changed = load_json(INBOX, {}), False
     for s in out:
@@ -1319,6 +1320,10 @@ def cmd_boot_resume(args: list) -> None:
         t, sid, cfg = s.get("terminal") or "", s["id"], s.get("config_dir") or os.path.join(HOME, ".claude")
         if sid in live:
             print(f"  skip {sid[:8]}: live again already"); continue
+        # 14.11: headless `claude -p` jobs (Max queue, API reviews) are listed as interactive too; their own queue
+        # requeues them. Snapshots older than the "headless" field: a plain terminal with no multiplexer is one.
+        if s.get("headless") or ("headless" not in s and t == "terminal"):
+            print(f"  skip {sid[:8]}: headless job (its queue requeues it)"); continue
         if t.startswith("tmux "):
             print(f"  skip {sid[:8]}: in tmux ({t}); its own unit brings it back"); continue
         conv = os.path.join(cfg, "projects", re.sub(r"[^A-Za-z0-9]", "-", s.get("cwd") or ""), f"{sid}.jsonl")
