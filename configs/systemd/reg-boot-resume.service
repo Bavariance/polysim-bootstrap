@@ -1,0 +1,21 @@
+[Unit]
+Description=Bring back the Claude sessions that were live on this machine before it went down (reg boot-resume)
+Documentation=file://%h/.claude/memory/shared/process/2026-11-14-globus-auto-recovery-design.md
+After=reg-collect.service network-online.target
+Wants=reg-collect.service network-online.target
+
+# Erik 14.11.2026, after the 13:59Z watchdog reset: "automatically boot up all the globus Claude sessions".
+# Runs once per boot (lingering starts user units at boot). reg-collect's first tick saves its last pre-boot
+# snapshot as <machine>.before-boot.json; this reads it 90 s later and starts every session that was live then,
+# each in its own Zellij session under `reg run` (transient units reg-agent-<name>), one every 45 s and only with
+# 1.5 GB free. Sessions in tmux (tum-agent) and anything already back are skipped. Log: ops events.log, "[reg]".
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/bin/sleep 90
+ExecStart=%h/.local/bin/reg boot-resume
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=default.target

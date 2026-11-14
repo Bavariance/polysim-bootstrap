@@ -21,6 +21,9 @@
                               the conversation on every start and starts it again after `reg restart` or a crash (any
                               exit other than 0; /exit and Ctrl+C give 0), with a prompt that says so. --keep: also
                               after a clean exit. --boot (reg-agent@.service): the first start gets that prompt too
+  reg boot-resume [--dry-run] at boot (reg-boot-resume.service): every Claude session that was live on this machine
+                              before it went down comes back in its own Zellij session under reg run --boot, on the
+                              same account and with Remote Control; one at a time, only with 1.5 GB free memory
   reg restart --check | --in 10m|--at HH:MM|--now --reason TEXT [--force] | --cancel | --status
                               run by a session on itself: restart onto the installed Claude Code at a safe moment
   reg side-notes [NAME] [--all]
@@ -321,6 +324,7 @@ def snapshot() -> list:
             "started_at": (d.get("startedAt") or 0) / 1000, "terminal": terminal(pid, d),
             "flags": flags(args), "launch_name": launch_name(args), "branch": branch(cwd),
             "title": title(cwd, d["sessionId"]),
+            "config_dir": os.path.dirname(os.path.dirname(path)),   # ~/.claude or ~/.claude-max5: the account
         })
     box, changed = load_json(INBOX, {}), False
     for s in out:
@@ -428,7 +432,11 @@ def push_pull(snap: dict) -> None:
 def collect_once() -> None:
     now = time.time()
     snap = {"machine": MACHINE, "ts": now, "sessions": snapshot(), "installed": installed_version()}
-    write_json(os.path.join(STATE, f"{MACHINE}.json"), snap)
+    own = os.path.join(STATE, f"{MACHINE}.json")
+    old = load_json(own, {})
+    if old.get("ts") and old["ts"] < boot_time():   # the last tick before this boot: what was live when it went down
+        write_json(os.path.join(STATE, f"{MACHINE}.before-boot.json"), old)
+    write_json(own, snap)
     if MACHINE != AUTHORITY:
         push_pull(snap)
         return
@@ -1216,6 +1224,12 @@ def wake_prompt(sid: str, why: str) -> str:
              "Everything the old process ran is gone: session crons, Monitors, background shell tasks and subagents. "
              "MCP servers are started again by Claude Code."]
     lines += rearm_lines(sid)
+    if time.time() - boot_time() < 1800:
+        lines.append("The machine itself restarted: read ~/.local/state/ops/boot-report.json (why: power cut, watchdog "
+                     "reset of a frozen kernel, or a clean reboot) and your handoff. Check every operation you had in "
+                     "flight (deploys: `polysim-deploy status`; open jobs: `python3 ~/.claude/memory/bin/jobs.py list`; "
+                     "merges, env flips, Max/Codex jobs) against LIVE state before you continue it, and never redo a "
+                     "step that already landed.")
     lines.append("When everything is back, post one line to Erik: what happened and what you re-armed. Then carry on "
                  "with your open work; your handoff file has it.")
     return "\n".join(lines)
@@ -1234,6 +1248,142 @@ def rearm_lines(sid: str) -> list:
         lines.append(f"You left no re-arm file ({path}). Bring back whatever crons, monitors and background jobs "
                      "you ran from your own notes, and run CronList before creating any cron.")
     return lines
+
+
+def boot_time() -> float:
+    with open("/proc/uptime") as f:
+        return time.time() - float(f.read().split()[0])
+
+
+BOOT_DONE = os.path.join(STATE, "boot-resume.done")   # the boot id the last boot-resume handled
+BOOT_GAP = 45                                         # seconds between two session starts
+BOOT_MEM_MB = 1500                                    # start the next one only with this much MemAvailable
+
+
+def mem_available_mb() -> int:
+    for line in open("/proc/meminfo"):
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) // 1024
+    return 0
+
+
+BOOT_BUDGET = 93            # a non-role session wakes with a prompt only while its account's week is below this
+
+
+def account_week_pct(cfg: str):
+    """The weekly % of the account a config dir belongs to, from the ops usage poll (None when unknown)."""
+    log = "claude_usage_max5.log" if cfg.rstrip("/").endswith("-max5") else "claude_usage.log"
+    try:
+        with open(os.path.join(HOME, ".local", "state", "ops", log)) as f:
+            last = f.read().strip().splitlines()[-1]
+        return int(re.search(r"weekly_all=(\d+)%", last).group(1))
+    except (OSError, IndexError, AttributeError, ValueError):
+        return None
+
+
+def cmd_boot_resume(args: list) -> None:
+    """Brings back every Claude session that was live here before the machine went down (14.11.2026, Erik: "think
+    about how we can automatically boot up all the globus Claude sessions"). Input: the collector's last tick before
+    this boot. A session that had ended before the crash is not in it, so nobody's closed session comes back. Sessions
+    in tmux belong to their own units (tum-agent) and are skipped, as is anything already live again."""
+    dry = "--dry-run" in args
+    # systemd-run --user needs the user bus; an ssh or agent shell on globus often has no XDG_RUNTIME_DIR (14.11)
+    os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    bid = read("/proc/sys/kernel/random/boot_id").strip()
+    try:
+        done = open(BOOT_DONE).read().strip()
+    except OSError:
+        done = ""
+    if done == bid and not dry and "--force" not in args:
+        print("reg boot-resume: already done for this boot")
+        return
+    snap = load_json(os.path.join(STATE, f"{MACHINE}.before-boot.json"), {})
+    booted = boot_time()
+    if not snap.get("ts") or snap["ts"] >= booted or booted - snap["ts"] > 3 * 86400:
+        print("reg boot-resume: no collector snapshot from before this boot (or older than 3 days): nothing to resume")
+        if not dry:
+            open(BOOT_DONE, "w").write(bid)
+        return
+    live = {s["id"] for s in snapshot()}
+    holders = {(v or {}).get("holder"): k for k, v in (load_json(ROLES, {}).get("roles") or {}).items()}
+    rows = [s for s in snap.get("sessions") or [] if s.get("kind") == "interactive"]
+    zcount = {}
+    for s in rows:
+        t = s.get("terminal") or ""
+        if t.startswith("zellij "):
+            zcount[t.split(" ")[1]] = zcount.get(t.split(" ")[1], 0) + 1
+    todo = []
+    # ops first (it finishes in-flight deploys), then the other role holders, then the rest, oldest first
+    order = lambda r: (holders.get(r["id"]) != "ops", r["id"] not in holders, r.get("started_at") or 0)
+    for s in sorted(rows, key=order):
+        t, sid, cfg = s.get("terminal") or "", s["id"], s.get("config_dir") or os.path.join(HOME, ".claude")
+        if sid in live:
+            print(f"  skip {sid[:8]}: live again already"); continue
+        if t.startswith("tmux "):
+            print(f"  skip {sid[:8]}: in tmux ({t}); its own unit brings it back"); continue
+        conv = os.path.join(cfg, "projects", re.sub(r"[^A-Za-z0-9]", "-", s.get("cwd") or ""), f"{sid}.jsonl")
+        if not os.path.isfile(conv):
+            print(f"  skip {sid[:8]}: no transcript at {conv}"); continue
+        z = t.split(" ")[1] if t.startswith("zellij ") else ""
+        zname = z if z and zcount.get(z) == 1 else f"{z or 'claude'}-{sid[:4]}"
+        zname = re.sub(r"[^A-Za-z0-9._-]", "-", zname)[:60]
+        # the agent layout expands $AGENT_CMD without re-parsing quotes, so the name must be a single safe word
+        name = re.sub(r"[^A-Za-z0-9._-]", "-", (s.get("name") or s.get("launch_name") or zname).strip('"'))[:60]
+        todo.append((s, cfg, zname, name))
+    print(f"reg boot-resume: snapshot {datetime.datetime.fromtimestamp(snap['ts']).strftime('%d.%m %H:%M:%S')}, "
+          f"{len(rows)} interactive session(s), {len(todo)} to bring back")
+    ev = os.path.join(HOME, ".local", "state", "ops", "events.log")
+    started = []
+    for i, (s, cfg, zname, name) in enumerate(todo):
+        flags = s.get("flags") or []
+        flags = flags if isinstance(flags, list) else []
+        envf = os.path.join(HOME, ".config", "reg-agent", f"{zname}.env")
+        # Every resumed session spends a turn on its wake prompt. A boot storm on an account near its weekly limit
+        # could use up the rest of the week (14.11: Ultra stood at 95%), so only ops, role holders on an account
+        # with room, and other sessions with room get the prompt; the rest resume quietly with Remote Control on.
+        pct = account_week_pct(cfg)
+        role = holders.get(s["id"])
+        wake = role == "ops" or pct is None or pct < BOOT_BUDGET
+        body = (f"AGENT_DIR={s['cwd']}\nAGENT_ID={s['id']}\nAGENT_NAME={name}\nAGENT_BOOT={'--boot' if wake else ''}\n"
+                f"AGENT_FLAGS={shlex.join(flags)}\nZELLIJ_SOCKET_DIR=/tmp/zellij-{os.getuid()}\n")
+        if os.path.realpath(cfg) != os.path.realpath(os.path.join(HOME, ".claude")):
+            body += f"CLAUDE_CONFIG_DIR={cfg}\n"
+        script = ('cd "$AGENT_DIR" || exit 1; zellij delete-session "$ZS" >/dev/null 2>&1; '
+                  'export AGENT_CMD="reg run --id $AGENT_ID --name $AGENT_NAME $AGENT_BOOT -- $AGENT_FLAGS"; '
+                  'zellij attach "$ZS" -b options --default-layout agent-session || exit 1; '
+                  'pid=$(pgrep -n -f "zellij --server .*/$ZS\\$") || exit 1; exec tail --pid="$pid" -f /dev/null')
+        cmd = ["systemd-run", "--user", "--collect", "--unit", f"reg-agent-{zname}", "-p", f"EnvironmentFile={envf}",
+               "-E", f"ZS={zname}", "-E", "TERM=xterm-256color", "-E", "COLORTERM=truecolor",
+               "-E", f"PATH={HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin", "/bin/sh", "-c", script]
+        line = (f"{name} ({s['id'][:8]}{', role ' + role if role else ''}, {os.path.basename(cfg)} week {pct}%) -> "
+                f"zellij {zname}" + ("" if wake else " (quiet: no wake prompt, account near its weekly limit)"))
+        if dry:
+            print(f"  would start {line}\n    {envf}:\n      " + body.strip().replace("\n", "\n      "))
+            continue
+        if i:
+            time.sleep(BOOT_GAP)
+        waited = 0
+        while mem_available_mb() < BOOT_MEM_MB and waited < 600:
+            time.sleep(15); waited += 15
+        if mem_available_mb() < BOOT_MEM_MB:
+            msg = f"[reg] NEEDS-OPS boot-resume: not started {line}: MemAvailable {mem_available_mb()} MB after 10 min"
+        else:
+            os.makedirs(os.path.dirname(envf), exist_ok=True)
+            with open(envf, "w") as f:
+                f.write(body)
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            ok = r.returncode == 0
+            if ok:
+                started.append(name)
+            msg = f"[reg] boot-resume: {'started' if ok else 'FAILED to start'} {line}" + ("" if ok else f": {r.stderr.strip()[:160]}")
+        print("  " + msg)
+        with open(ev, "a") as f:
+            f.write(time.strftime("%m-%d %H:%MZ", time.gmtime()) + " " + msg + "\n")
+    if not dry:
+        open(BOOT_DONE, "w").write(bid)
+        with open(ev, "a") as f:
+            f.write(time.strftime("%m-%d %H:%MZ", time.gmtime()) +
+                    f" [reg] boot-resume done: {len(started)}/{len(todo)} session(s) back: {', '.join(started) or '-'}\n")
 
 
 def cmd_run(args: list) -> None:
@@ -1274,7 +1424,8 @@ def cmd_run(args: list) -> None:
             prompt = wake_prompt(sid, wake)
         # The stable install path, not PATH: under fnm, PATH points into a per-shell directory that fnm may delete.
         exe = binary or next((b for b in CLAUDE_BINS if runnable(b)), "") or shutil.which("claude") or "claude"
-        conv = os.path.isfile(os.path.join(HOME, ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd), f"{sid}.jsonl"))
+        cfg = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+        conv = os.path.isfile(os.path.join(cfg, "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd), f"{sid}.jsonl"))
         cmd = [exe] + (["--resume", sid] if conv else ["--session-id", sid])
         if name:
             cmd += ["--name", name, "--remote-control", name]
@@ -2037,6 +2188,8 @@ def main() -> None:
         cmd_side_notes_hook() if "--hook" in args else cmd_side_notes(args)
     elif cmd == "run":
         cmd_run(args)
+    elif cmd == "boot-resume":
+        cmd_boot_resume(args)
     elif cmd == "restart":
         cmd_restart(args)
     elif cmd == "_fire":
