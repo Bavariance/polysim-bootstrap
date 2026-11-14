@@ -65,10 +65,14 @@ done
 unset _polysim_bin
 
 # fnm (Node version manager) — activates the default node, prepending its
-# bin dir (containing globally-npm-installed CLIs like `claude`) to PATH.
+# bin dir (containing globally-npm-installed CLIs like `codex`) to PATH.
 if command -v fnm >/dev/null 2>&1; then
   eval "$(fnm env --shell bash)"
 fi
+
+# Claude Code is the native install in ~/.local/bin, whose updates are atomic. A session started before the move
+# off npm (2026-11-03) can still put an npm copy under fnm; this keeps that copy from winning.
+[ -x "$HOME/.local/bin/claude" ] && PATH="$HOME/.local/bin:$PATH"
 
 # direnv
 if command -v direnv >/dev/null 2>&1; then
