@@ -2100,6 +2100,38 @@ def cmd_compact_fire(sid: str) -> None:
     log_compact(sid, event="done")
 
 
+
+WAKE_TAG = "[reg wake: automated, NOT Erik]"
+
+
+def cmd_wake(args: list) -> None:
+    """For scripts (critical_scan.py): type one line into a live session's input box when it is idle, so an unhandled
+    critical event reaches a session that is waiting between turns (18.11, Erik: "Our systems must be fully reliable and not
+    just context dependent"). Usage: reg wake --sid SESSION_ID --text TEXT. Ticketed like compact: the prompt guard marks it
+    automation that approves nothing."""
+    if "--sid" not in args or "--text" not in args:
+        print("usage: reg wake --sid SESSION_ID --text TEXT", file=sys.stderr); sys.exit(2)
+    sid = args[args.index("--sid") + 1]
+    text = " ".join(args[args.index("--text") + 1].split())[:1500]
+    rec = next((d for f in session_files() for d in [load_json(f, {})] if isinstance(d, dict) and d.get("sessionId") == sid), None)
+    if not rec:
+        print(f"reg wake: no live session {sid}", file=sys.stderr); sys.exit(1)
+    pid = int(rec.get("pid") or 0)
+    p = pane_of(pid)
+    if not p:
+        print("reg wake: the session has no Zellij or tmux pane", file=sys.stderr); sys.exit(1)
+    os.makedirs(COMPACTS, exist_ok=True)
+    path = os.path.join(COMPACTS, f"{sid}.wake.json")
+    typed = f"{WAKE_TAG} {text}"
+    req = {"id": sid, "pid": pid, "proc_start": str(rec.get("procStart") or ""), "cwd": rec.get("cwd", ""), "pane": p,
+           "text": text, "requested_at": time.time(), "state": "scheduled", "transcript_size": size(transcript(sid))}
+    write_json(path, req)
+    ticket(sid, typed)
+    why = send_when_idle(req, path, typed, time.time() + 600)
+    req.update(state="done" if not why else f"not sent: {why}", done_at=time.time())
+    write_json(path, req)
+    print("woke" if not why else f"not sent: {why}")
+
 def cmd_update_note() -> None:
     """UserPromptSubmit hook: one notice per session and installed version. Silent on any error."""
     try:
@@ -2199,6 +2231,8 @@ def main() -> None:
         cmd_restart(args)
     elif cmd == "_fire":
         cmd_fire(args[0])
+    elif cmd == "wake":
+        cmd_wake(args)
     elif cmd == "compact":
         cmd_compact(args)
     elif cmd == "_compact":
