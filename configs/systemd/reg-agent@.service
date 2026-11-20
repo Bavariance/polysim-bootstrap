@@ -1,6 +1,5 @@
 [Unit]
 Description=Claude session in Zellij session %i, resumed under reg run at boot
-Documentation=https://claude.ai/code/artifact/a828a4fa-5c67-4630-9e48-732fbd84649d
 After=network-online.target
 Wants=network-online.target
 
@@ -11,8 +10,8 @@ Wants=network-online.target
 # 2026-10-19.
 #
 # ~/.config/reg-agent/%i.env holds what differs per session:
-#   AGENT_DIR=/home/vespucci/projects/polysimulator      the folder the conversation belongs to
-#   AGENT_ID=e4820566-16a4-40b4-9075-ca9455d397c5         its conversation id
+#   AGENT_DIR=/home/USER/projects/APP                    the folder the conversation belongs to
+#   AGENT_ID=<conversation id>                            its conversation id
 #   AGENT_FLAGS=--dangerously-skip-permissions            claude flags after reg run's --
 #   ZELLIJ_SOCKET_DIR=/tmp/zellij-1001                    globus only: ssh shells there have no XDG_RUNTIME_DIR and
 #                                                         look under /tmp/zellij-<uid>; without it the session would
